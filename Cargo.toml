@@ -1,0 +1,17 @@
+[package]
+name = "claude-guard"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+brush-parser = "0.4.0"
+color-eyre = "0.6.5"
+jiff = "0.2.35"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tracing = "0.1.44"
+tracing-error = "0.2.1"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+assert_cmd = "2.2.2"
