@@ -35,6 +35,33 @@ fn hook_with_garbage_stdin_exits_zero_and_stays_silent() {
 }
 
 #[test]
+fn hook_with_a_real_bash_input_and_no_rules_stays_silent() {
+    let fixture = r#"{
+      "session_id": "abc123",
+      "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
+      "transcript_path": "/Users/x/.claude/projects/p/transcript.jsonl",
+      "cwd": "/Users/x/code/proj",
+      "permission_mode": "default",
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": {
+        "command": "git stash",
+        "description": "Stash changes",
+        "timeout": 120000,
+        "run_in_background": false
+      },
+      "tool_use_id": "toolu_01ABC123"
+    }"#;
+    guard()
+        .arg("hook")
+        .write_stdin(fixture)
+        .assert()
+        .code(0)
+        .stdout("")
+        .stderr("");
+}
+
+#[test]
 fn session_start_with_garbage_stdin_exits_zero() {
     guard()
         .arg("session-start")

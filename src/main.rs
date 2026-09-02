@@ -6,6 +6,11 @@
 //! - stdout carries a decision only when a rule speaks
 //! - stderr carries diagnostics, visible with `claude --debug`
 
+mod input;
+// Rules arrive in a later step; until then nothing emits a decision.
+#[allow(dead_code)]
+mod output;
+
 use std::io::{IsTerminal, Read};
 use std::panic::{self, AssertUnwindSafe};
 use std::process::ExitCode;
@@ -74,9 +79,15 @@ fn run(subcommand: Option<&str>) -> Result<()> {
     }
 }
 
-/// PreToolUse handler. Stub until the input types and rule engine exist.
-fn hook(input: &str) -> Result<()> {
-    tracing::debug!(bytes = input.len(), "hook invoked");
+/// PreToolUse handler. Parses the input; rules arrive in a later step.
+fn hook(raw: &str) -> Result<()> {
+    let input = input::parse(raw)?;
+    tracing::debug!(
+        session = %input.session_id,
+        tool = input.tool.name(),
+        cwd = %input.cwd.display(),
+        "hook invoked"
+    );
     Ok(())
 }
 
