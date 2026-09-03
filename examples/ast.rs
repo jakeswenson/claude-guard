@@ -12,24 +12,24 @@ use std::io::Cursor;
 use brush_parser::{Parser, ParserOptions, word};
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let opts = ParserOptions::default();
+  let args: Vec<String> = std::env::args().skip(1).collect();
+  let opts = ParserOptions::default();
 
-    match args.as_slice() {
-        [flag, w] if flag == "--word" => match word::parse(w, &opts) {
-            Ok(pieces) => println!("{pieces:#?}"),
-            Err(e) => println!("word parse error: {e}"),
-        },
-        [cmd] => {
-            let mut parser = Parser::new(Cursor::new(cmd.as_bytes()), &opts);
-            match parser.parse_program() {
-                Ok(program) => println!("{program:#?}"),
-                Err(e) => println!("parse error: {e}"),
-            }
-        }
-        _ => {
-            eprintln!("usage: cargo run --example ast -- '<command>' | --word '<word>'");
-            std::process::exit(1);
-        }
+  match args.as_slice() {
+    [flag, w] if flag == "--word" => match word::parse(w, &opts) {
+      Ok(pieces) => println!("{pieces:#?}"),
+      Err(e) => println!("word parse error: {e}"),
+    },
+    [cmd] => {
+      let mut parser = Parser::new(Cursor::new(cmd.as_bytes()), &opts);
+      match parser.parse_program() {
+        Ok(program) => println!("{program:#?}"),
+        Err(e) => println!("parse error: {e}"),
+      }
     }
+    _ => {
+      eprintln!("usage: cargo run --example ast -- '<command>' | --word '<word>'");
+      std::process::exit(1);
+    }
+  }
 }
