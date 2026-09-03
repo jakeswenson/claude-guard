@@ -7,9 +7,12 @@
 //! - stderr carries diagnostics, visible with `claude --debug`
 
 mod input;
-// Rules arrive in a later step; until then nothing emits a decision.
+// Rules arrive in a later step; until then nothing emits a decision and
+// nothing segments a command.
 #[allow(dead_code)]
 mod output;
+#[allow(dead_code)]
+mod segment;
 
 use std::io::{IsTerminal, Read};
 use std::panic::{self, AssertUnwindSafe};
