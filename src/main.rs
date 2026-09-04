@@ -12,6 +12,8 @@ mod input;
 #[allow(dead_code)]
 mod output;
 #[allow(dead_code)]
+mod pattern;
+#[allow(dead_code)]
 mod segment;
 
 use std::io::{IsTerminal, Read};
