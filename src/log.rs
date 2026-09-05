@@ -190,7 +190,8 @@ impl Record {
   }
 
   /// The record for an event the guard only watches. The payload goes in
-  /// whole, because its shape is what these records exist to capture.
+  /// with its shape intact and its long strings reduced to sizes, because
+  /// the shape is what these records exist to capture.
   pub fn observed(
     envelope: &Envelope,
     ts: Timestamp,
@@ -204,12 +205,36 @@ impl Record {
       agent_id: envelope.agent_id.clone(),
       cwd: envelope.cwd.clone(),
       tool: envelope.tool_name.clone(),
-      subject: Subject::Raw(envelope.payload.clone()),
+      subject: Subject::Raw(digest(envelope.payload.clone())),
       outcome: Outcome::Observed,
       rule: None,
       pattern: None,
       reason: None,
     }
+  }
+}
+
+/// Strings longer than this in an observed payload are replaced by their
+/// size. Below it a value is a path, a flag, or a short message and worth
+/// keeping; above it, it is content, and content is what bloats the log
+/// and carries secrets.
+const DIGEST_THRESHOLD: usize = 256;
+
+/// Replace every long string in `value` with `{"bytes": n, "lines": m}`,
+/// recursively. Structure and short scalars survive, so the payload shape
+/// stays readable. No sample of the text is kept, on purpose.
+fn digest(value: serde_json::Value) -> serde_json::Value {
+  use serde_json::Value;
+  match value {
+    Value::String(s) if s.len() > DIGEST_THRESHOLD => serde_json::json!({
+      "bytes": s.len(),
+      "lines": s.lines().count(),
+    }),
+    Value::Array(items) => Value::Array(items.into_iter().map(digest).collect()),
+    Value::Object(fields) => {
+      Value::Object(fields.into_iter().map(|(k, v)| (k, digest(v))).collect())
+    }
+    other => other,
   }
 }
 
@@ -634,6 +659,62 @@ mod tests {
     let r = record("s1", bash("git stash"));
     let json = serde_json::to_string(&r).unwrap();
     assert_eq!(serde_json::from_str::<Record>(&json).unwrap(), r);
+  }
+
+  #[test]
+  fn long_strings_in_observed_payloads_become_sizes() {
+    let big = "x".repeat(300);
+    let three_lines = format!("{big}\n{big}\n{big}");
+    let payload = serde_json::json!({
+      "session_id": "s9",
+      "cwd": "/Users/x",
+      "hook_event_name": "PostToolUse",
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_9",
+      "tool_input": {"command": "cat big", "content": big},
+      "tool_response": {
+        "stdout": three_lines,
+        "stderr": "",
+        "interrupted": false,
+        "nested": [{"deep": big}, "short", 7]
+      }
+    });
+    let envelope = crate::input::envelope(&payload.to_string()).unwrap();
+    let r = Record::observed(&envelope, at("2026-09-05T10:00:00Z"));
+    let Subject::Raw(raw) = r.subject else {
+      panic!("not raw");
+    };
+    assert_eq!(raw["tool_input"]["command"], "cat big");
+    assert_eq!(
+      raw["tool_input"]["content"],
+      serde_json::json!({"bytes": 300, "lines": 1})
+    );
+    assert_eq!(
+      raw["tool_response"]["stdout"],
+      serde_json::json!({"bytes": 902, "lines": 3})
+    );
+    assert_eq!(raw["tool_response"]["stderr"], "");
+    assert_eq!(raw["tool_response"]["interrupted"], false);
+    assert_eq!(
+      raw["tool_response"]["nested"],
+      serde_json::json!([{"deep": {"bytes": 300, "lines": 1}}, "short", 7])
+    );
+    assert_eq!(raw["tool_use_id"], "toolu_9");
+  }
+
+  #[test]
+  fn a_string_at_the_threshold_is_kept_verbatim() {
+    let exact = "y".repeat(DIGEST_THRESHOLD);
+    let over = "y".repeat(DIGEST_THRESHOLD + 1);
+    let digested = digest(serde_json::json!([exact, over]));
+    assert_eq!(
+      digested[0],
+      serde_json::Value::String("y".repeat(DIGEST_THRESHOLD))
+    );
+    assert_eq!(
+      digested[1],
+      serde_json::json!({"bytes": DIGEST_THRESHOLD + 1, "lines": 1})
+    );
   }
 
   // --- the store ---
