@@ -89,6 +89,17 @@ or asked, and can spot rules that should change.
   `<sessionId>/subagents/agent-<agentId>.jsonl`. Whether the transcript
   records dialog answers is not documented.
 
+- Live capture, 2026-09-05, closes the riskiest assumption the wrong way:
+  `PermissionDenied` does not fire when the user clicks deny in the
+  dialog. Only `PermissionRequest` fires, and it has no `tool_use_id`. The
+  click is recorded in Claude Code's transcript at `transcript_path`, as a
+  user line whose `tool_result` has `is_error: true` and whose
+  `toolUseResult` is "User rejected tool use", keyed by `tool_use_id`. So D6
+  and D9 are feasible by reading the transcript for the tool use ids in the
+  guard's own records. The transcript format is undocumented; the reader
+  must parse leniently and fail open. (claude-guard-7dn closed,
+  claude-guard-2mb carries the design.)
+
 ## Tradeoffs Chosen
 
 - Chose files-as-truth with a watching UI over a daemon the hook reports to,
