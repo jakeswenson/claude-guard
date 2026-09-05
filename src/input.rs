@@ -130,6 +130,84 @@ impl fmt::Display for WorkingDir {
   }
 }
 
+/// Which hook event Claude Code is reporting, from `hook_event_name`.
+/// Only PreToolUse gets a decision; the rest are recorded for study.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Event {
+  PreToolUse,
+  PermissionRequest,
+  PermissionDenied,
+  PostToolUse,
+  SessionStart,
+  SessionEnd,
+}
+
+/// The fields every hook event shares, plus the payload whole. Parsed
+/// first so the hook can dispatch on the event before it commits to a
+/// shape for the rest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Envelope {
+  pub event: Event,
+  pub session_id: SessionId,
+  pub cwd: WorkingDir,
+  /// Present on tool events; absent on SessionStart.
+  pub tool_use_id: Option<ToolUseId>,
+  pub tool_name: Option<ToolName>,
+  pub agent_id: Option<AgentId>,
+  pub payload: serde_json::Value,
+}
+
+/// Parse the common fields. Fails on an event name the guard does not
+/// know, which means a hook was registered for an event this version
+/// does not handle.
+pub fn envelope(json: &str) -> Result<Envelope> {
+  let payload: serde_json::Value =
+    serde_json::from_str(json).wrap_err("parse hook input as JSON")?;
+  let common: Common =
+    serde_json::from_value(payload.clone()).wrap_err("parse the hook event's common fields")?;
+  Ok(Envelope {
+    event: common.hook_event_name,
+    session_id: common.session_id,
+    cwd: common.cwd,
+    tool_use_id: common.tool_use_id,
+    tool_name: common.tool_name,
+    agent_id: common.agent_id,
+    payload,
+  })
+}
+
+/// The wire shape shared by every event. Claude Code's PascalCase event
+/// names are mapped onto [`Event`] here.
+#[derive(Deserialize)]
+struct Common {
+  #[serde(deserialize_with = "event_from_wire")]
+  hook_event_name: Event,
+  session_id: SessionId,
+  cwd: WorkingDir,
+  #[serde(default)]
+  tool_use_id: Option<ToolUseId>,
+  #[serde(default)]
+  tool_name: Option<ToolName>,
+  #[serde(default)]
+  agent_id: Option<AgentId>,
+}
+
+fn event_from_wire<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Event, D::Error> {
+  let name = String::deserialize(d)?;
+  match name.as_str() {
+    "PreToolUse" => Ok(Event::PreToolUse),
+    "PermissionRequest" => Ok(Event::PermissionRequest),
+    "PermissionDenied" => Ok(Event::PermissionDenied),
+    "PostToolUse" => Ok(Event::PostToolUse),
+    "SessionStart" => Ok(Event::SessionStart),
+    "SessionEnd" => Ok(Event::SessionEnd),
+    other => Err(serde::de::Error::custom(format!(
+      "unknown hook event {other:?}"
+    ))),
+  }
+}
+
 /// One PreToolUse invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookInput {
@@ -302,7 +380,7 @@ mod tests {
   use super::*;
   use serde_json::json;
 
-  fn envelope(
+  fn envelope_json(
     tool_name: &str,
     tool_input: serde_json::Value,
   ) -> String {
@@ -322,7 +400,7 @@ mod tests {
 
   #[test]
   fn bash_carries_the_command_and_ignores_extra_fields() {
-    let input = parse(&envelope(
+    let input = parse(&envelope_json(
       "Bash",
       json!({"command": "git stash", "description": "stash", "timeout": 1000}),
     ))
@@ -361,7 +439,7 @@ mod tests {
         },
       ),
     ] {
-      let input = parse(&envelope(
+      let input = parse(&envelope_json(
         name,
         json!({"file_path": "/tmp/x", "content": "hi"}),
       ))
@@ -373,7 +451,7 @@ mod tests {
 
   #[test]
   fn read_fetch_glob_and_grep_keep_their_subject() {
-    let input = parse(&envelope(
+    let input = parse(&envelope_json(
       "Read",
       json!({"file_path": "/etc/hosts", "limit": 5}),
     ))
@@ -385,7 +463,7 @@ mod tests {
       }
     );
 
-    let input = parse(&envelope(
+    let input = parse(&envelope_json(
       "WebFetch",
       json!({"url": "https://example.com/x", "prompt": "summarize"}),
     ))
@@ -397,7 +475,7 @@ mod tests {
       }
     );
 
-    let input = parse(&envelope("Glob", json!({"pattern": "**/*.rs"}))).unwrap();
+    let input = parse(&envelope_json("Glob", json!({"pattern": "**/*.rs"}))).unwrap();
     assert_eq!(
       input.tool,
       Tool::Glob {
@@ -406,7 +484,7 @@ mod tests {
       }
     );
 
-    let input = parse(&envelope(
+    let input = parse(&envelope_json(
       "Grep",
       json!({"pattern": "todo!", "path": "src", "output_mode": "content"}),
     ))
@@ -423,7 +501,7 @@ mod tests {
 
   #[test]
   fn mcp_tools_split_into_server_and_tool() {
-    let input = parse(&envelope(
+    let input = parse(&envelope_json(
       "mcp__github__create_pull_request",
       json!({"owner": "x", "repo": "y", "title": "t"}),
     ))
@@ -461,7 +539,7 @@ mod tests {
 
   #[test]
   fn unknown_tool_keeps_its_name_and_whole_input() {
-    let input = parse(&envelope(
+    let input = parse(&envelope_json(
       "Agent",
       json!({"prompt": "look around", "model": "haiku"}),
     ))
@@ -479,7 +557,7 @@ mod tests {
   #[test]
   fn agent_id_is_read_when_present() {
     let mut v: serde_json::Value =
-      serde_json::from_str(&envelope("Bash", json!({"command": "ls"}))).unwrap();
+      serde_json::from_str(&envelope_json("Bash", json!({"command": "ls"}))).unwrap();
     v["agent_id"] = json!("agent-7");
     v["agent_type"] = json!("Explore");
     let input = parse(&v.to_string()).unwrap();
@@ -496,15 +574,56 @@ mod tests {
   }
 
   #[test]
+  fn the_envelope_carries_the_event_and_the_whole_payload() {
+    let env = envelope(&envelope_json("Bash", json!({"command": "ls"}))).unwrap();
+    assert_eq!(env.event, Event::PreToolUse);
+    assert_eq!(env.session_id, SessionId::from("sess-1"));
+    assert_eq!(env.tool_use_id, Some(ToolUseId::from("toolu_01")));
+    assert_eq!(env.tool_name, Some(ToolName::from("Bash")));
+    assert_eq!(env.payload["tool_input"]["command"], "ls");
+
+    let session_start = json!({
+      "session_id": "sess-2",
+      "cwd": "/Users/x",
+      "hook_event_name": "SessionStart",
+      "source": "startup"
+    })
+    .to_string();
+    let env = envelope(&session_start).unwrap();
+    assert_eq!(env.event, Event::SessionStart);
+    assert_eq!(env.tool_use_id, None);
+    assert_eq!(env.tool_name, None);
+    assert_eq!(env.payload["source"], "startup");
+  }
+
+  #[test]
+  fn every_documented_event_name_maps() {
+    for (wire, event) in [
+      ("PreToolUse", Event::PreToolUse),
+      ("PermissionRequest", Event::PermissionRequest),
+      ("PermissionDenied", Event::PermissionDenied),
+      ("PostToolUse", Event::PostToolUse),
+      ("SessionStart", Event::SessionStart),
+      ("SessionEnd", Event::SessionEnd),
+    ] {
+      let json = json!({"session_id": "s", "cwd": "/", "hook_event_name": wire}).to_string();
+      assert_eq!(envelope(&json).unwrap().event, event, "{wire}");
+    }
+    let json = json!({"session_id": "s", "cwd": "/", "hook_event_name": "Stop"}).to_string();
+    let err = envelope(&json).unwrap_err();
+    assert!(err.to_string().contains("common fields"), "{err}");
+  }
+
+  #[test]
   fn bash_without_command_is_an_error() {
-    let err = parse(&envelope("Bash", json!({"description": "no command"}))).unwrap_err();
+    let err = parse(&envelope_json("Bash", json!({"description": "no command"}))).unwrap_err();
     assert!(err.to_string().contains("tool_input for Bash"), "{err}");
   }
 
   #[test]
   fn missing_session_id_is_an_error() {
     let mut v: serde_json::Value =
-      serde_json::from_str(&envelope("Bash", json!({"command": "ls"}))).unwrap();
+      serde_json::from_str(&envelope_json("Bash", json!({"command": "ls"}))).unwrap();
     v.as_object_mut().unwrap().remove("session_id");
     assert!(parse(&v.to_string()).is_err());
   }

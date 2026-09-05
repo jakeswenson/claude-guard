@@ -151,6 +151,72 @@ fn hook_writes_one_log_line_per_call_including_passes() {
 }
 
 #[test]
+fn other_events_are_recorded_whole_and_stay_silent() {
+  let state = state_dir();
+  let payload = r#"{
+      "session_id": "abc123",
+      "cwd": "/Users/x/code/proj",
+      "hook_event_name": "PermissionDenied",
+      "tool_name": "Bash",
+      "tool_input": {"command": "git log"},
+      "tool_use_id": "toolu_02",
+      "reason": "whatever Claude Code sends here"
+    }"#;
+  guard_logging_to(state.path())
+    .arg("hook")
+    .write_stdin(payload)
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr("");
+
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let line: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+  assert_eq!(line["event"], "permission_denied");
+  assert_eq!(line["outcome"], "observed");
+  assert_eq!(line["tool"], "Bash");
+  assert_eq!(line["tool_use_id"], "toolu_02");
+  assert_eq!(
+    line["subject"]["raw"]["reason"],
+    "whatever Claude Code sends here"
+  );
+  assert_eq!(line["rule"], serde_json::Value::Null);
+}
+
+#[test]
+fn session_start_is_recorded_and_stays_silent() {
+  let state = state_dir();
+  let payload = r#"{"session_id": "abc123", "cwd": "/Users/x", "hook_event_name": "SessionStart", "source": "startup"}"#;
+  guard_logging_to(state.path())
+    .arg("session-start")
+    .write_stdin(payload)
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr("");
+
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let line: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+  assert_eq!(line["event"], "session_start");
+  assert_eq!(line["outcome"], "observed");
+  assert_eq!(line["tool"], serde_json::Value::Null);
+  assert_eq!(line["subject"]["raw"]["source"], "startup");
+}
+
+#[test]
+fn an_unknown_event_fails_open() {
+  let state = state_dir();
+  let payload = r#"{"session_id": "abc123", "cwd": "/Users/x", "hook_event_name": "Stop"}"#;
+  guard_logging_to(state.path())
+    .arg("hook")
+    .write_stdin(payload)
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains("unknown hook event"));
+}
+
+#[test]
 fn hook_still_denies_when_the_log_cannot_be_written() {
   let state = state_dir();
   let blocked = state.path().join("blocked");

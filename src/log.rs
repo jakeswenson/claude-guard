@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::input::{
-  AgentId, McpServer, McpTool, SessionId, Tool, ToolName, ToolUseId, WorkingDir, string_id,
+  AgentId, Envelope, Event, McpServer, McpTool, SessionId, Tool, ToolName, ToolUseId, WorkingDir,
+  string_id,
 };
 use crate::output::Decision;
 use crate::rules::{Context, PatternText, RuleName, Seen, Verdict};
@@ -36,16 +37,9 @@ impl SchemaVersion {
   pub const CURRENT: SchemaVersion = SchemaVersion::V1;
 }
 
-/// Which Claude Code hook event produced the record. One variant today;
-/// the dialog-answer memory adds more.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Event {
-  PreToolUse,
-}
-
 /// What the guard did. `Pass` is a record too: no record means the guard
-/// was never called.
+/// was never called. `Observed` is an event the guard records without
+/// deciding anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Outcome {
@@ -53,6 +47,7 @@ pub enum Outcome {
   Deny,
   Ask,
   Warn,
+  Observed,
 }
 
 /// What the guard looked at, typed by tool. Never null: an unmodeled tool
@@ -150,10 +145,11 @@ pub struct Record {
   pub ts: Timestamp,
   pub event: Event,
   pub session_id: SessionId,
-  pub tool_use_id: ToolUseId,
+  /// Absent on events without a tool call, such as SessionStart.
+  pub tool_use_id: Option<ToolUseId>,
   pub agent_id: Option<AgentId>,
   pub cwd: WorkingDir,
-  pub tool: ToolName,
+  pub tool: Option<ToolName>,
   pub subject: Subject,
   pub outcome: Outcome,
   pub rule: Option<RuleName>,
@@ -181,15 +177,38 @@ impl Record {
       ts,
       event: Event::PreToolUse,
       session_id: input.session_id.clone(),
-      tool_use_id: input.tool_use_id.clone(),
+      tool_use_id: Some(input.tool_use_id.clone()),
       agent_id: input.agent_id.clone(),
       cwd: input.cwd.clone(),
-      tool: input.tool.name(),
+      tool: Some(input.tool.name()),
       subject,
       outcome,
       rule: verdict.map(|v| v.rule.clone()),
       pattern: verdict.and_then(|v| v.pattern.clone()),
       reason,
+    }
+  }
+
+  /// The record for an event the guard only watches. The payload goes in
+  /// whole, because its shape is what these records exist to capture.
+  pub fn observed(
+    envelope: &Envelope,
+    ts: Timestamp,
+  ) -> Record {
+    Record {
+      v: SchemaVersion::CURRENT,
+      ts,
+      event: envelope.event,
+      session_id: envelope.session_id.clone(),
+      tool_use_id: envelope.tool_use_id.clone(),
+      agent_id: envelope.agent_id.clone(),
+      cwd: envelope.cwd.clone(),
+      tool: envelope.tool_name.clone(),
+      subject: Subject::Raw(envelope.payload.clone()),
+      outcome: Outcome::Observed,
+      rule: None,
+      pattern: None,
+      reason: None,
     }
   }
 }
@@ -517,6 +536,49 @@ mod tests {
       serde_json::json!({
         "mcp": {"server": "github", "tool": "create_pull_request", "input": {"owner": "x", "repo": "y"}}
       })
+    );
+  }
+
+  #[test]
+  fn an_observed_event_keeps_its_payload_whole() {
+    let payload = serde_json::json!({
+      "session_id": "s9",
+      "cwd": "/Users/x",
+      "hook_event_name": "PermissionDenied",
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_9",
+      "something_undocumented": {"we": "keep"}
+    });
+    let envelope = crate::input::envelope(&payload.to_string()).unwrap();
+    let r = Record::observed(&envelope, at("2026-09-05T10:00:00Z"));
+    assert_eq!(r.event, Event::PermissionDenied);
+    assert_eq!(r.outcome, Outcome::Observed);
+    assert_eq!(r.tool, Some(ToolName::from("Bash")));
+    assert_eq!(r.tool_use_id, Some(ToolUseId::from("toolu_9")));
+    assert_eq!(r.subject, Subject::Raw(payload));
+    assert_eq!((&r.rule, &r.pattern, &r.reason), (&None, &None, &None));
+
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(json.contains(r#""event":"permission_denied""#), "{json}");
+    assert!(json.contains(r#""outcome":"observed""#), "{json}");
+  }
+
+  #[test]
+  fn a_session_start_record_has_no_tool() {
+    let payload = serde_json::json!({
+      "session_id": "s9",
+      "cwd": "/Users/x",
+      "hook_event_name": "SessionStart",
+      "source": "compact"
+    });
+    let envelope = crate::input::envelope(&payload.to_string()).unwrap();
+    let r = Record::observed(&envelope, at("2026-09-05T10:00:00Z"));
+    assert_eq!(r.event, Event::SessionStart);
+    assert_eq!((&r.tool, &r.tool_use_id), (&None, &None));
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(
+      json.contains(r#""tool_use_id":null,"agent_id":null,"cwd":"/Users/x","tool":null"#),
+      "{json}"
     );
   }
 

@@ -89,31 +89,46 @@ fn run(subcommand: Option<&str>) -> Result<()> {
   }
 }
 
-/// PreToolUse handler. Parse, build the context, evaluate, log, print.
+/// Hook handler for every event. The event name in the payload decides:
+/// PreToolUse gets a decision, everything else is recorded and stays
+/// silent, so Claude Code behaves as if no hook ran.
+fn hook(raw: &str) -> Result<()> {
+  let envelope = input::envelope(raw)?;
+  tracing::debug!(
+      event = ?envelope.event,
+      session = %envelope.session_id,
+      cwd = %envelope.cwd,
+      "hook invoked"
+  );
+  match envelope.event {
+    input::Event::PreToolUse => pre_tool_use(raw),
+    _ => observe(&envelope),
+  }
+}
+
+/// SessionStart handler. Records the payload until the brief exists; the
+/// brief will print from here.
+fn session_start(raw: &str) -> Result<()> {
+  let envelope = input::envelope(raw)?;
+  observe(&envelope)
+}
+
+/// Parse, build the context, evaluate, log, print.
 ///
 /// The log is written before stdout so a crash while printing still
 /// leaves the record, and a log failure is one warning on stderr that
 /// changes nothing about the decision.
-fn hook(raw: &str) -> Result<()> {
+fn pre_tool_use(raw: &str) -> Result<()> {
   let input = input::parse(raw)?;
-  tracing::debug!(
-      session = %input.session_id,
-      tool = %input.tool.name(),
-      cwd = %input.cwd,
-      "hook invoked"
-  );
-
   let rules = rules::Ruleset::builtin().wrap_err("compile built-in rules")?;
   let ctx = rules::Context::new(input);
   let verdict = rules.evaluate(&ctx);
 
-  let record = log::Record::pre_tool_use(&ctx, verdict.as_ref(), jiff::Timestamp::now());
-  if let Err(report) = log::Store::from_env().and_then(|mut store| store.write(&record)) {
-    tracing::warn!(
-      error = %chain(&report),
-      "decision log write failed; the decision still stands"
-    );
-  }
+  record(log::Record::pre_tool_use(
+    &ctx,
+    verdict.as_ref(),
+    jiff::Timestamp::now(),
+  ));
 
   match verdict {
     Some(verdict) => {
@@ -125,10 +140,21 @@ fn hook(raw: &str) -> Result<()> {
   Ok(())
 }
 
-/// SessionStart handler. Stub until the brief exists.
-fn session_start(input: &str) -> Result<()> {
-  tracing::debug!(bytes = input.len(), "session-start invoked");
+/// Record an event the guard does not decide on. Nothing goes to stdout.
+fn observe(envelope: &input::Envelope) -> Result<()> {
+  record(log::Record::observed(envelope, jiff::Timestamp::now()));
   Ok(())
+}
+
+/// Append one record. A failure is one warning on stderr and nothing
+/// else; the caller's decision, if any, still prints.
+fn record(record: log::Record) {
+  if let Err(report) = log::Store::from_env().and_then(|mut store| store.write(&record)) {
+    tracing::warn!(
+      error = %chain(&report),
+      "decision log write failed; the decision still stands"
+    );
+  }
 }
 
 /// color-eyre for error and panic reports, tracing to stderr behind
