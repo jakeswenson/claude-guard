@@ -7,13 +7,10 @@
 //! - stderr carries diagnostics, visible with `claude --debug`
 
 mod input;
-// Rules arrive in a later step; until then nothing emits a decision and
-// nothing segments a command.
-#[allow(dead_code)]
 mod output;
-#[allow(dead_code)]
 mod pattern;
-#[allow(dead_code)]
+mod repo;
+mod rules;
 mod segment;
 
 use std::io::{IsTerminal, Read};
@@ -84,7 +81,9 @@ fn run(subcommand: Option<&str>) -> Result<()> {
   }
 }
 
-/// PreToolUse handler. Parses the input; rules arrive in a later step.
+/// PreToolUse handler. Parse, build the context, evaluate, print. The
+/// decision log arrives in a later step and will sit between evaluate and
+/// print.
 fn hook(raw: &str) -> Result<()> {
   let input = input::parse(raw)?;
   tracing::debug!(
@@ -93,6 +92,16 @@ fn hook(raw: &str) -> Result<()> {
       cwd = %input.cwd.display(),
       "hook invoked"
   );
+
+  let rules = rules::Ruleset::builtin().wrap_err("compile built-in rules")?;
+  let ctx = rules::Context::new(input);
+  match rules.evaluate(&ctx) {
+    Some(verdict) => {
+      tracing::info!(rule = %verdict.rule, decision = ?verdict.decision, "verdict");
+      println!("{}", verdict.decision.to_json());
+    }
+    None => tracing::debug!("no opinion"),
+  }
   Ok(())
 }
 

@@ -202,15 +202,16 @@ impl Token {
       (_, Word::Dynamic(_)) => false,
       (Token::Literal(wanted), Word::Literal(found)) => wanted == found,
       (Token::Option | Token::Options, Word::Literal(found)) => found.starts_with('-'),
-      (Token::Under(prefix), Word::Literal(found)) => normalize(found).starts_with(prefix),
+      (Token::Under(prefix), Word::Literal(found)) => {
+        normalize_path(Path::new(found)).starts_with(prefix)
+      }
     }
   }
 }
 
 /// macOS mounts `/tmp` as a link to `/private/tmp`; both spellings name
 /// the same place. Relative paths are left alone: the matcher has no cwd.
-fn normalize(path: &str) -> PathBuf {
-  let path = Path::new(path);
+pub fn normalize_path(path: &Path) -> PathBuf {
   match path.strip_prefix("/private") {
     Ok(rest) => Path::new("/").join(rest),
     Err(_) => path.to_path_buf(),

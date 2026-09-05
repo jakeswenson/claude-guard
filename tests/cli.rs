@@ -34,9 +34,10 @@ fn hook_with_garbage_stdin_exits_zero_and_stays_silent() {
     .stdout("");
 }
 
-#[test]
-fn hook_with_a_real_bash_input_and_no_rules_stays_silent() {
-  let fixture = r#"{
+/// A PreToolUse payload as Claude Code sends it, with `command` swapped in.
+fn bash_call(command: &str) -> String {
+  format!(
+    r#"{{
       "session_id": "abc123",
       "prompt_id": "550e8400-e29b-41d4-a716-446655440000",
       "transcript_path": "/Users/x/.claude/projects/p/transcript.jsonl",
@@ -44,20 +45,41 @@ fn hook_with_a_real_bash_input_and_no_rules_stays_silent() {
       "permission_mode": "default",
       "hook_event_name": "PreToolUse",
       "tool_name": "Bash",
-      "tool_input": {
-        "command": "git stash",
-        "description": "Stash changes",
+      "tool_input": {{
+        "command": "{command}",
+        "description": "run a command",
         "timeout": 120000,
         "run_in_background": false
-      },
+      }},
       "tool_use_id": "toolu_01ABC123"
-    }"#;
+    }}"#
+  )
+}
+
+#[test]
+fn hook_stays_silent_when_no_rule_matches() {
   guard()
     .arg("hook")
-    .write_stdin(fixture)
+    .write_stdin(bash_call("cargo nextest run"))
     .assert()
     .code(0)
     .stdout("")
+    .stderr("");
+}
+
+#[test]
+fn hook_denies_git_stash_with_the_wire_format() {
+  guard()
+    .arg("hook")
+    .write_stdin(bash_call("git stash"))
+    .assert()
+    .code(0)
+    .stdout(
+      "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\
+       \"permissionDecisionReason\":\"claude-guard denied `git stash`: jj has no dirty tree, so there \
+       is nothing to stash. Instead: use `jj new` to park the current change or `jj describe` to \
+       name it.\"}}\n",
+    )
     .stderr("");
 }
 
