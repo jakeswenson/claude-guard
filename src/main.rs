@@ -7,6 +7,7 @@
 //! - stderr carries diagnostics, visible with `claude --debug`
 
 mod input;
+mod log;
 mod output;
 mod pattern;
 mod repo;
@@ -19,6 +20,7 @@ use std::process::ExitCode;
 
 use color_eyre::config::{HookBuilder, Theme};
 use color_eyre::eyre::{Result, WrapErr, bail};
+use log::Writer as _;
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -49,13 +51,19 @@ fn main() -> ExitCode {
 fn fail_open(work: impl FnOnce() -> Result<()>) -> ExitCode {
   match panic::catch_unwind(AssertUnwindSafe(work)) {
     Ok(Ok(())) => {}
-    Ok(Err(report)) => {
-      let chain: Vec<String> = report.chain().map(ToString::to_string).collect();
-      eprintln!("claude-guard: failed open: {}", chain.join(": "));
-    }
+    Ok(Err(report)) => eprintln!("claude-guard: failed open: {}", chain(&report)),
     Err(_) => eprintln!("claude-guard: failed open after a panic; tool call proceeds"),
   }
   ExitCode::SUCCESS
+}
+
+/// The full cause chain on one line, outermost first.
+fn chain(report: &color_eyre::Report) -> String {
+  report
+    .chain()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join(": ")
 }
 
 /// Dispatch on the subcommand. Stdin is read here, once, so both
@@ -81,21 +89,33 @@ fn run(subcommand: Option<&str>) -> Result<()> {
   }
 }
 
-/// PreToolUse handler. Parse, build the context, evaluate, print. The
-/// decision log arrives in a later step and will sit between evaluate and
-/// print.
+/// PreToolUse handler. Parse, build the context, evaluate, log, print.
+///
+/// The log is written before stdout so a crash while printing still
+/// leaves the record, and a log failure is one warning on stderr that
+/// changes nothing about the decision.
 fn hook(raw: &str) -> Result<()> {
   let input = input::parse(raw)?;
   tracing::debug!(
       session = %input.session_id,
-      tool = input.tool.name(),
-      cwd = %input.cwd.display(),
+      tool = %input.tool.name(),
+      cwd = %input.cwd,
       "hook invoked"
   );
 
   let rules = rules::Ruleset::builtin().wrap_err("compile built-in rules")?;
   let ctx = rules::Context::new(input);
-  match rules.evaluate(&ctx) {
+  let verdict = rules.evaluate(&ctx);
+
+  let record = log::Record::pre_tool_use(&ctx, verdict.as_ref(), jiff::Timestamp::now());
+  if let Err(report) = log::Store::from_env().and_then(|mut store| store.write(&record)) {
+    tracing::warn!(
+      error = %chain(&report),
+      "decision log write failed; the decision still stands"
+    );
+  }
+
+  match verdict {
     Some(verdict) => {
       tracing::info!(rule = %verdict.rule, decision = ?verdict.decision, "verdict");
       println!("{}", verdict.decision.to_json());

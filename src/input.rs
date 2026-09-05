@@ -3,24 +3,146 @@
 //! Only the fields the guard uses are modeled. Everything else in the JSON
 //! is ignored, so a new field from Claude Code never breaks parsing.
 //! Field names verified against the hooks reference on 2026-09-01.
+//!
+//! The identifiers are newtypes. A `SessionId` names a log file and a
+//! `WorkingDir` is where a jj repo is looked for, and neither should ever
+//! be passed where the other is expected.
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use color_eyre::eyre::{Result, WrapErr};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+/// A string newtype: transparent in JSON, opaque in code. Shared with the
+/// other modules that mint identifiers.
+macro_rules! string_id {
+  ($(#[$doc:meta])* $name:ident) => {
+    $(#[$doc])*
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(transparent)]
+    pub struct $name(String);
+
+    impl From<String> for $name {
+      fn from(value: String) -> Self {
+        Self(value)
+      }
+    }
+
+    impl From<&str> for $name {
+      fn from(value: &str) -> Self {
+        Self(value.to_string())
+      }
+    }
+
+    impl AsRef<str> for $name {
+      fn as_ref(&self) -> &str {
+        &self.0
+      }
+    }
+
+    impl ::std::fmt::Display for $name {
+      fn fmt(
+        &self,
+        f: &mut ::std::fmt::Formatter<'_>,
+      ) -> ::std::fmt::Result {
+        f.write_str(&self.0)
+      }
+    }
+  };
+}
+pub(crate) use string_id;
+
+string_id! {
+  /// One Claude Code session. Also the name of that session's log file.
+  SessionId
+}
+
+string_id! {
+  /// One tool call within a session.
+  ToolUseId
+}
+
+string_id! {
+  /// The subagent making the call, when there is one.
+  AgentId
+}
+
+string_id! {
+  /// A tool name as Claude Code spells it: `Bash`, `Write`, `Read`, or
+  /// `mcp__<server>__<tool>` for an MCP tool.
+  ToolName
+}
+
+string_id! {
+  /// The MCP server half of `mcp__<server>__<tool>`.
+  McpServer
+}
+
+string_id! {
+  /// The tool half of `mcp__<server>__<tool>`.
+  McpTool
+}
+
+impl ToolName {
+  /// Split `mcp__<server>__<tool>`. The server ends at the first `__`
+  /// after the prefix, so a tool name may itself contain `__`. Anything
+  /// else, including `mcp__` with no second separator, is not MCP.
+  pub fn mcp(&self) -> Option<(McpServer, McpTool)> {
+    let rest = self.0.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+      return None;
+    }
+    Some((McpServer::from(server), McpTool::from(tool)))
+  }
+}
+
+/// The directory Claude Code reports for the call.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkingDir(PathBuf);
+
+impl From<PathBuf> for WorkingDir {
+  fn from(value: PathBuf) -> Self {
+    Self(value)
+  }
+}
+
+impl From<&str> for WorkingDir {
+  fn from(value: &str) -> Self {
+    Self(PathBuf::from(value))
+  }
+}
+
+impl AsRef<Path> for WorkingDir {
+  fn as_ref(&self) -> &Path {
+    &self.0
+  }
+}
+
+impl fmt::Display for WorkingDir {
+  fn fmt(
+    &self,
+    f: &mut fmt::Formatter<'_>,
+  ) -> fmt::Result {
+    write!(f, "{}", self.0.display())
+  }
+}
 
 /// One PreToolUse invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookInput {
-  pub session_id: String,
-  pub cwd: PathBuf,
-  pub tool_use_id: String,
+  pub session_id: SessionId,
+  pub cwd: WorkingDir,
+  pub tool_use_id: ToolUseId,
   /// Present only when the hook fires inside a subagent.
-  pub agent_id: Option<String>,
+  pub agent_id: Option<AgentId>,
   pub tool: Tool,
 }
 
-/// The tool about to run, with the one field of its input the rules read.
+/// The tool about to run, with the part of its input the guard keeps: what
+/// the rules read, and what the log records as the subject.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Tool {
   Bash {
@@ -35,21 +157,48 @@ pub enum Tool {
   MultiEdit {
     path: PathBuf,
   },
-  /// Any tool the guard has no rules for. The name is kept for the log.
+  Read {
+    path: PathBuf,
+  },
+  WebFetch {
+    url: String,
+  },
+  Glob {
+    pattern: String,
+    path: Option<PathBuf>,
+  },
+  Grep {
+    pattern: String,
+    path: Option<PathBuf>,
+  },
+  /// An MCP tool. Inputs are per server, so the whole input is kept.
+  Mcp {
+    name: ToolName,
+    server: McpServer,
+    tool: McpTool,
+    input: serde_json::Value,
+  },
+  /// Any tool the guard has not modeled. The whole input is kept so the
+  /// log record still explains itself.
   Other {
-    name: String,
+    name: ToolName,
+    input: serde_json::Value,
   },
 }
 
 impl Tool {
   /// The tool name as Claude Code spells it.
-  pub fn name(&self) -> &str {
+  pub fn name(&self) -> ToolName {
     match self {
-      Self::Bash { .. } => "Bash",
-      Self::Write { .. } => "Write",
-      Self::Edit { .. } => "Edit",
-      Self::MultiEdit { .. } => "MultiEdit",
-      Self::Other { name } => name,
+      Self::Bash { .. } => ToolName::from("Bash"),
+      Self::Write { .. } => ToolName::from("Write"),
+      Self::Edit { .. } => ToolName::from("Edit"),
+      Self::MultiEdit { .. } => ToolName::from("MultiEdit"),
+      Self::Read { .. } => ToolName::from("Read"),
+      Self::WebFetch { .. } => ToolName::from("WebFetch"),
+      Self::Glob { .. } => ToolName::from("Glob"),
+      Self::Grep { .. } => ToolName::from("Grep"),
+      Self::Mcp { name, .. } | Self::Other { name, .. } => name.clone(),
     }
   }
 }
@@ -57,7 +206,7 @@ impl Tool {
 /// Parse the raw hook JSON.
 pub fn parse(json: &str) -> Result<HookInput> {
   let raw: Raw = serde_json::from_str(json).wrap_err("parse PreToolUse hook input")?;
-  let tool = match raw.tool_name.as_str() {
+  let tool = match raw.tool_name.as_ref() {
     "Bash" => {
       let BashInput { command } = tool_input(&raw)?;
       Tool::Bash { command }
@@ -71,8 +220,31 @@ pub fn parse(json: &str) -> Result<HookInput> {
     "MultiEdit" => Tool::MultiEdit {
       path: tool_input::<FileInput>(&raw)?.file_path,
     },
-    _ => Tool::Other {
-      name: raw.tool_name.clone(),
+    "Read" => Tool::Read {
+      path: tool_input::<FileInput>(&raw)?.file_path,
+    },
+    "WebFetch" => Tool::WebFetch {
+      url: tool_input::<UrlInput>(&raw)?.url,
+    },
+    "Glob" => {
+      let SearchInput { pattern, path } = tool_input(&raw)?;
+      Tool::Glob { pattern, path }
+    }
+    "Grep" => {
+      let SearchInput { pattern, path } = tool_input(&raw)?;
+      Tool::Grep { pattern, path }
+    }
+    _ => match raw.tool_name.mcp() {
+      Some((server, tool)) => Tool::Mcp {
+        name: raw.tool_name.clone(),
+        server,
+        tool,
+        input: raw.tool_input.clone(),
+      },
+      None => Tool::Other {
+        name: raw.tool_name.clone(),
+        input: raw.tool_input.clone(),
+      },
     },
   };
   Ok(HookInput {
@@ -88,12 +260,12 @@ pub fn parse(json: &str) -> Result<HookInput> {
 /// depends on `tool_name`, and that dispatch happens in [`parse`].
 #[derive(Deserialize)]
 struct Raw {
-  session_id: String,
-  cwd: PathBuf,
-  tool_use_id: String,
+  session_id: SessionId,
+  cwd: WorkingDir,
+  tool_use_id: ToolUseId,
   #[serde(default)]
-  agent_id: Option<String>,
-  tool_name: String,
+  agent_id: Option<AgentId>,
+  tool_name: ToolName,
   tool_input: serde_json::Value,
 }
 
@@ -105,6 +277,19 @@ struct BashInput {
 #[derive(Deserialize)]
 struct FileInput {
   file_path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct UrlInput {
+  url: String,
+}
+
+/// Glob and Grep share this shape: a pattern and an optional directory.
+#[derive(Deserialize)]
+struct SearchInput {
+  pattern: String,
+  #[serde(default)]
+  path: Option<PathBuf>,
 }
 
 fn tool_input<T: for<'de> Deserialize<'de>>(raw: &Raw) -> Result<T> {
@@ -142,9 +327,9 @@ mod tests {
       json!({"command": "git stash", "description": "stash", "timeout": 1000}),
     ))
     .unwrap();
-    assert_eq!(input.session_id, "sess-1");
-    assert_eq!(input.cwd, PathBuf::from("/Users/x/code/proj"));
-    assert_eq!(input.tool_use_id, "toolu_01");
+    assert_eq!(input.session_id, SessionId::from("sess-1"));
+    assert_eq!(input.cwd, WorkingDir::from("/Users/x/code/proj"));
+    assert_eq!(input.tool_use_id, ToolUseId::from("toolu_01"));
     assert_eq!(input.agent_id, None);
     assert_eq!(
       input.tool,
@@ -182,20 +367,113 @@ mod tests {
       ))
       .unwrap();
       assert_eq!(input.tool, expected, "{name}");
-      assert_eq!(input.tool.name(), name);
+      assert_eq!(input.tool.name(), ToolName::from(name));
     }
   }
 
   #[test]
-  fn unknown_tool_keeps_its_name() {
-    let input = parse(&envelope("Read", json!({"file_path": "/etc/hosts"}))).unwrap();
+  fn read_fetch_glob_and_grep_keep_their_subject() {
+    let input = parse(&envelope(
+      "Read",
+      json!({"file_path": "/etc/hosts", "limit": 5}),
+    ))
+    .unwrap();
+    assert_eq!(
+      input.tool,
+      Tool::Read {
+        path: "/etc/hosts".into()
+      }
+    );
+
+    let input = parse(&envelope(
+      "WebFetch",
+      json!({"url": "https://example.com/x", "prompt": "summarize"}),
+    ))
+    .unwrap();
+    assert_eq!(
+      input.tool,
+      Tool::WebFetch {
+        url: "https://example.com/x".into()
+      }
+    );
+
+    let input = parse(&envelope("Glob", json!({"pattern": "**/*.rs"}))).unwrap();
+    assert_eq!(
+      input.tool,
+      Tool::Glob {
+        pattern: "**/*.rs".into(),
+        path: None
+      }
+    );
+
+    let input = parse(&envelope(
+      "Grep",
+      json!({"pattern": "todo!", "path": "src", "output_mode": "content"}),
+    ))
+    .unwrap();
+    assert_eq!(
+      input.tool,
+      Tool::Grep {
+        pattern: "todo!".into(),
+        path: Some("src".into())
+      }
+    );
+    assert_eq!(input.tool.name(), ToolName::from("Grep"));
+  }
+
+  #[test]
+  fn mcp_tools_split_into_server_and_tool() {
+    let input = parse(&envelope(
+      "mcp__github__create_pull_request",
+      json!({"owner": "x", "repo": "y", "title": "t"}),
+    ))
+    .unwrap();
+    assert_eq!(
+      input.tool,
+      Tool::Mcp {
+        name: ToolName::from("mcp__github__create_pull_request"),
+        server: McpServer::from("github"),
+        tool: McpTool::from("create_pull_request"),
+        input: json!({"owner": "x", "repo": "y", "title": "t"}),
+      }
+    );
+    assert_eq!(
+      input.tool.name(),
+      ToolName::from("mcp__github__create_pull_request")
+    );
+  }
+
+  #[test]
+  fn mcp_names_split_at_the_first_separator_after_the_prefix() {
+    let split = |name: &str| ToolName::from(name).mcp();
+    assert_eq!(
+      split("mcp__claude_ai_Gmail__complete__auth"),
+      Some((
+        McpServer::from("claude_ai_Gmail"),
+        McpTool::from("complete__auth")
+      ))
+    );
+    assert_eq!(split("mcp__only"), None);
+    assert_eq!(split("mcp____tool"), None);
+    assert_eq!(split("mcp__server__"), None);
+    assert_eq!(split("Bash"), None);
+  }
+
+  #[test]
+  fn unknown_tool_keeps_its_name_and_whole_input() {
+    let input = parse(&envelope(
+      "Agent",
+      json!({"prompt": "look around", "model": "haiku"}),
+    ))
+    .unwrap();
     assert_eq!(
       input.tool,
       Tool::Other {
-        name: "Read".into()
+        name: ToolName::from("Agent"),
+        input: json!({"prompt": "look around", "model": "haiku"}),
       }
     );
-    assert_eq!(input.tool.name(), "Read");
+    assert_eq!(input.tool.name().to_string(), "Agent");
   }
 
   #[test]
@@ -205,7 +483,16 @@ mod tests {
     v["agent_id"] = json!("agent-7");
     v["agent_type"] = json!("Explore");
     let input = parse(&v.to_string()).unwrap();
-    assert_eq!(input.agent_id.as_deref(), Some("agent-7"));
+    assert_eq!(input.agent_id, Some(AgentId::from("agent-7")));
+  }
+
+  #[test]
+  fn ids_are_transparent_in_json() {
+    let id: SessionId = serde_json::from_str("\"abc\"").unwrap();
+    assert_eq!(id, SessionId::from("abc"));
+    assert_eq!(serde_json::to_string(&id).unwrap(), "\"abc\"");
+    let dir: WorkingDir = serde_json::from_str("\"/x/y\"").unwrap();
+    assert_eq!(serde_json::to_string(&dir).unwrap(), "\"/x/y\"");
   }
 
   #[test]

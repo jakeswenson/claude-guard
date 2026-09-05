@@ -24,6 +24,7 @@ use std::io::Cursor;
 use brush_parser::ast;
 use brush_parser::word::{self, WordPiece, WordPieceWithSource};
 use brush_parser::{Parser, ParserOptions};
+use serde::{Deserialize, Serialize};
 
 /// Everything the segmenter found in one Bash tool call.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -37,7 +38,7 @@ pub struct Segments {
 }
 
 /// One command the shell would exec: its words and its file redirects.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SimpleCommand {
   /// Command name first, then arguments. Empty only for a redirect
   /// with no command, such as `( a; b ) > out` or a bare `> out`.
@@ -47,7 +48,8 @@ pub struct SimpleCommand {
 
 /// A word after quote removal, or the raw text when the shell would
 /// expand it at run time and the guard cannot know the result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Word {
   Literal(String),
   Dynamic(String),
@@ -55,13 +57,14 @@ pub enum Word {
 
 /// A redirect that names a file. Fd duplication (`2>&1`), heredocs, and
 /// here-strings never reach the rules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Redirect {
   pub kind: RedirectKind,
   pub target: Word,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RedirectKind {
   /// `>`, `>|`, `<>`, `&>`, and `n>`.
   Write,

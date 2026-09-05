@@ -11,7 +11,7 @@
 
 use std::path::PathBuf;
 
-use crate::input::{HookInput, Tool};
+use crate::input::{HookInput, Tool, string_id};
 use crate::output::Decision;
 use crate::pattern::{self, Pattern, PatternError};
 use crate::repo;
@@ -225,8 +225,6 @@ pub const RULES: &[Rule] = &[
 /// Everything the engine knows about one tool call. Built once in `hook`.
 #[derive(Debug)]
 pub struct Context {
-  /// Read by the decision log once it exists.
-  #[allow(dead_code)]
   pub input: HookInput,
   pub seen: Seen,
   pub in_jj_repo: bool,
@@ -243,7 +241,7 @@ pub enum Seen {
 impl Context {
   /// Segment the command and look for a jj repo around `cwd`.
   pub fn new(input: HookInput) -> Context {
-    let in_jj_repo = repo::in_jj_repo(&input.cwd);
+    let in_jj_repo = repo::in_jj_repo(input.cwd.as_ref());
     Context::with_repo(input, in_jj_repo)
   }
 
@@ -257,7 +255,12 @@ impl Context {
       Tool::Write { path } | Tool::Edit { path } | Tool::MultiEdit { path } => {
         Seen::File(path.clone())
       }
-      Tool::Other { .. } => Seen::Other,
+      Tool::Read { .. }
+      | Tool::WebFetch { .. }
+      | Tool::Glob { .. }
+      | Tool::Grep { .. }
+      | Tool::Mcp { .. }
+      | Tool::Other { .. } => Seen::Other,
     };
     Context {
       input,
@@ -267,11 +270,23 @@ impl Context {
   }
 }
 
-/// The engine's answer. `rule` names the table row, or `parse-error` and
-/// `uninspected` for the two answers that come from the engine itself.
+string_id! {
+  /// A rule's name from the table, or `parse-error` and `uninspected` for
+  /// the two answers the engine gives on its own.
+  RuleName
+}
+
+string_id! {
+  /// The text of the subject that fired: a pattern, or a path prefix.
+  PatternText
+}
+
+/// The engine's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
-  pub rule: String,
+  pub rule: RuleName,
+  /// `None` for the engine's own answers, which have no table row.
+  pub pattern: Option<PatternText>,
   pub decision: Decision,
 }
 
@@ -331,7 +346,8 @@ impl Ruleset {
   ) -> Option<Verdict> {
     if let Seen::Bash(Err(e)) = &ctx.seen {
       return Some(Verdict {
-        rule: "parse-error".into(),
+        rule: RuleName::from("parse-error"),
+        pattern: None,
         decision: Decision::Ask {
           reason: format!("claude-guard could not parse this command: {e}"),
         },
@@ -345,7 +361,8 @@ impl Ruleset {
       for (matcher, guidance) in &rule.subjects {
         if let Some(what) = matcher.find(&ctx.seen) {
           return Some(Verdict {
-            rule: rule.name.into(),
+            rule: RuleName::from(rule.name),
+            pattern: Some(matcher.text()),
             decision: render(rule.decision, &what, guidance),
           });
         }
@@ -362,7 +379,8 @@ impl Ruleset {
         .collect::<Vec<_>>()
         .join(", ");
       return Some(Verdict {
-        rule: "uninspected".into(),
+        rule: RuleName::from("uninspected"),
+        pattern: None,
         decision: Decision::Warn {
           context: format!("claude-guard did not inspect: {list}"),
         },
@@ -374,6 +392,14 @@ impl Ruleset {
 }
 
 impl Matcher {
+  /// The subject as written in the table, for the log.
+  fn text(&self) -> PatternText {
+    match self {
+      Matcher::Command(pattern) => PatternText::from(pattern.to_string()),
+      Matcher::FileUnder(prefix) => PatternText::from(format!("{}/**", prefix.display())),
+    }
+  }
+
   /// The text of what matched, for the reason line.
   fn find(
     &self,
@@ -442,7 +468,7 @@ mod tests {
   fn input(tool: Tool) -> HookInput {
     HookInput {
       session_id: "s".into(),
-      cwd: PathBuf::from("/nowhere"),
+      cwd: "/nowhere".into(),
       tool_use_id: "t".into(),
       agent_id: None,
       tool,
@@ -477,7 +503,28 @@ mod tests {
   }
 
   fn rule_name(verdict: Option<Verdict>) -> String {
-    verdict.expect("a verdict").rule
+    verdict.expect("a verdict").rule.to_string()
+  }
+
+  #[test]
+  fn a_verdict_names_the_row_that_fired() {
+    let verdict = run(bash("git stash"), false).unwrap();
+    assert_eq!(
+      verdict.pattern,
+      Some(PatternText::from("git -... stash ..."))
+    );
+
+    let verdict = run(
+      Tool::Write {
+        path: "/tmp/x".into(),
+      },
+      false,
+    )
+    .unwrap();
+    assert_eq!(verdict.pattern, Some(PatternText::from("/tmp/**")));
+
+    let verdict = run(bash("git stash &&"), false).unwrap();
+    assert_eq!(verdict.pattern, None);
   }
 
   // --- the table itself ---
@@ -697,7 +744,7 @@ mod tests {
   #[test]
   fn an_unparseable_command_asks_the_user() {
     let verdict = run(bash("git stash &&"), false).unwrap();
-    assert_eq!(verdict.rule, "parse-error");
+    assert_eq!(verdict.rule, RuleName::from("parse-error"));
     assert_eq!(
       verdict.decision,
       Decision::Ask {
@@ -709,7 +756,7 @@ mod tests {
   #[test]
   fn uninspected_substitutions_warn_when_nothing_else_speaks() {
     let verdict = run(bash("echo $(git stash) `date`"), false).unwrap();
-    assert_eq!(verdict.rule, "uninspected");
+    assert_eq!(verdict.rule, RuleName::from("uninspected"));
     assert_eq!(
       verdict.decision,
       Decision::Warn {
@@ -738,8 +785,18 @@ mod tests {
   fn tools_without_rules_pass() {
     assert_eq!(
       run(
+        Tool::Read {
+          path: "/tmp/x".into()
+        },
+        true
+      ),
+      None
+    );
+    assert_eq!(
+      run(
         Tool::Other {
-          name: "Read".into()
+          name: "Agent".into(),
+          input: serde_json::json!({"prompt": "git stash"}),
         },
         true
       ),
