@@ -1,10 +1,12 @@
 //! The executable spec: `check` forms in the rule language, run as tests.
 //!
 //! ```text
-//! check := (check [pattern] matches "command")
-//!        | (check [pattern] misses  "command")
-//!        | (check [pattern] binds   "command" <set>)
+//! check := (check [pattern] matches "command" [decls])
+//!        | (check [pattern] misses  "command" [decls])
+//!        | (check [pattern] binds   "command" <set> [decls])
+//!        | (check "command" elaborates (name item...) [decls])
 //!        | (check (cond) holds|fails|unknown [:with <pairs>] [:cwd "path"] [:ancestors <fs>])
+//! decls := :commands ((command ...) ...)   ; declarations in force for this check
 //! set   := (?name "word")*            ; one binding set, as pairs
 //!        | ((?name "word")*)+         ; several sets, each in its own list
 //! fs    := ("name" ...)               ; entries an ancestor of cwd has; the rest do not
@@ -14,7 +16,8 @@
 //! A command must segment to one simple command. `binds` passes when the
 //! matcher's binding sets are exactly the ones written, in order. A
 //! condition check parses its condition with the binders `:with` gives
-//! it, so an unbound binder is a failure of the check, not a panic.
+//! it, so an unbound binder is a failure of the check, not a panic. An
+//! `elaborates` check compares against the notation [`show`] renders.
 //!
 //! Files under `spec/` are the spec. Every failing check prints as
 //! `file:line:col: message`, and the test fails once at the end with the
@@ -27,8 +30,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::cond::{self, Cond, Env, Fs, Scope, Truth};
+use crate::elaborate::{Declarations, Elaborated, Inner, Part};
 use crate::pattern::{Bindings, Pattern, Var};
-use crate::segment;
+use crate::segment::{self, RedirectKind, SimpleCommand, Word};
 use crate::sexp::{self, Kind as Sx, Node, Span};
 use crate::syntax::{self, Subject, TypeError};
 
@@ -160,8 +164,75 @@ fn run_check(form: &Node) -> Result<(), TypeError> {
       check_pattern(form, &pattern, verb, verb_name, args)
     }
     Sx::List(_) => check_cond(form, subject, verb, verb_name, args),
-    _ => err(subject.span, "expected a [pattern] or a (condition)"),
+    Sx::Str(_) => check_elaboration(form, subject, verb, verb_name, args),
+    _ => err(
+      subject.span,
+      "expected a [pattern], a (condition), or a \"command\"",
+    ),
   }
+}
+
+/// Split a trailing `:commands (...)` clause off `args`, returning the
+/// declarations it names and the arguments before it. No clause means
+/// no declarations, so every word is a plain unit.
+fn split_commands(args: &[Node]) -> Result<(&[Node], Declarations), TypeError> {
+  let Some(at) = args
+    .iter()
+    .position(|n| matches!(&n.kind, Sx::Keyword(k) if k == "commands"))
+  else {
+    return Ok((args, Declarations::new()));
+  };
+  let Some(value) = args.get(at + 1) else {
+    return err(
+      args[at].span,
+      "`:commands` needs a list of (command ...) forms",
+    );
+  };
+  if let Some(extra) = args.get(at + 2) {
+    return err(
+      extra.span,
+      format!("unexpected `{extra}` after `:commands`"),
+    );
+  }
+  let Sx::List(forms) = &value.kind else {
+    return err(
+      value.span,
+      "`:commands` takes a list of (command ...) forms",
+    );
+  };
+  let file = syntax::parse(forms).map_err(|mut errors| errors.remove(0))?;
+  if let Some(rule) = file.rules.first() {
+    return err(
+      rule.span,
+      "`:commands` takes (command ...) forms, not rules",
+    );
+  }
+  let mut declarations = Declarations::new();
+  for command in file.commands {
+    declarations.declare(&command.name, command.declaration);
+  }
+  Ok((&args[..at], declarations))
+}
+
+/// Segment one command string into its only simple command.
+fn one_command(node: &Node) -> Result<SimpleCommand, TypeError> {
+  let Sx::Str(command) = &node.kind else {
+    return err(node.span, "expected a command string");
+  };
+  let mut segments = segment::segment(command).map_err(|e| TypeError {
+    span: node.span,
+    message: format!("command does not parse: {e}"),
+  })?;
+  if segments.commands.len() != 1 {
+    return err(
+      node.span,
+      format!(
+        "command must be one simple command, found {}",
+        segments.commands.len()
+      ),
+    );
+  }
+  Ok(segments.commands.remove(0))
 }
 
 // --- pattern checks ---
@@ -173,26 +244,13 @@ fn check_pattern(
   verb_name: &str,
   args: &[Node],
 ) -> Result<(), TypeError> {
+  let (args, declarations) = split_commands(args)?;
   let Some((command_node, rest)) = args.split_first() else {
     return err(form.span, format!("`{verb_name}` needs a command string"));
   };
-  let Sx::Str(command) = &command_node.kind else {
-    return err(command_node.span, "expected a command string");
-  };
-  let mut segments = segment::segment(command).map_err(|e| TypeError {
-    span: command_node.span,
-    message: format!("command does not parse: {e}"),
-  })?;
-  if segments.commands.len() != 1 {
-    return err(
-      command_node.span,
-      format!(
-        "command must be one simple command, found {}",
-        segments.commands.len()
-      ),
-    );
-  }
-  let found = pattern.bindings(&segments.commands.remove(0));
+  let command = one_command(command_node)?;
+  let elaborated = declarations.elaborate(&command);
+  let found = pattern.bindings_in(&elaborated.units(), &elaborated.redirects);
 
   match verb_name {
     "matches" => {
@@ -297,6 +355,119 @@ fn show_sets(sets: &[Bindings]) -> String {
     })
     .collect::<Vec<_>>()
     .join(" ")
+}
+
+// --- elaboration checks ---
+
+/// `(check "command" elaborates (name item...) [:commands (...)])`. The
+/// actual elaboration is rendered in the same form and compared as text,
+/// so a failure prints both sides in the notation the spec uses.
+fn check_elaboration(
+  form: &Node,
+  subject: &Node,
+  verb: &Node,
+  verb_name: &str,
+  args: &[Node],
+) -> Result<(), TypeError> {
+  if verb_name != "elaborates" {
+    return err(verb.span, format!("unknown elaboration verb `{verb_name}`"));
+  }
+  let (args, declarations) = split_commands(args)?;
+  let [expected] = args else {
+    return err(form.span, "`elaborates` takes one expected form");
+  };
+  let command = one_command(subject)?;
+  let got = show(&declarations.elaborate(&command)).flat();
+  let wanted = expected.flat();
+  if got != wanted {
+    return err(form.span, format!("expected {wanted}, got {got}"));
+  }
+  Ok(())
+}
+
+/// An elaboration in the spec's notation:
+///
+/// ```text
+/// (git (option "-C" C ".") "clean" (option "-fxd" f x d)
+///      (> "out") (subcommand clean) (inner (command (sed "-i"))))
+/// ```
+///
+/// The name is a symbol; an argument is a string; an option is its text,
+/// then its flags as symbols, then its value as a string or `(attached
+/// "v")`; a dynamic word is `(dynamic "text")`; a redirect is its
+/// operator and target. `subcommand` and `inner` come last when present.
+fn show(e: &Elaborated) -> Node {
+  fn at(kind: Sx) -> Node {
+    Node {
+      span: Span { line: 0, col: 0 },
+      kind,
+    }
+  }
+  fn word(w: &Word) -> Node {
+    match w {
+      Word::Literal(t) => at(Sx::Str(t.clone())),
+      Word::Dynamic(t) => at(Sx::List(vec![
+        at(Sx::Symbol("dynamic".into())),
+        at(Sx::Str(t.clone())),
+      ])),
+    }
+  }
+  let mut items = Vec::new();
+  let mut name = None;
+  for part in &e.parts {
+    match part {
+      Part::Name(Word::Literal(t)) => name = Some(at(Sx::Symbol(t.clone()))),
+      Part::Name(w) => name = Some(word(w)),
+      Part::Arg(w) => items.push(word(w)),
+      Part::Option(group) => {
+        let mut option = vec![at(Sx::Symbol("option".into())), word(&group.text)];
+        option.extend(group.flags.iter().map(|f| at(Sx::Symbol(f.clone()))));
+        if let Some(value) = &group.value {
+          option.push(if value.attached {
+            at(Sx::List(vec![
+              at(Sx::Symbol("attached".into())),
+              word(&value.text),
+            ]))
+          } else {
+            word(&value.text)
+          });
+        }
+        items.push(at(Sx::List(option)));
+      }
+    }
+  }
+  for redirect in &e.redirects {
+    let op = match redirect.kind {
+      RedirectKind::Write => ">",
+      RedirectKind::Append => ">>",
+      RedirectKind::Read => "<",
+    };
+    items.push(at(Sx::List(vec![
+      at(Sx::Symbol(op.into())),
+      word(&redirect.target),
+    ])));
+  }
+  if !e.subcommand.is_empty() {
+    let mut sub = vec![at(Sx::Symbol("subcommand".into()))];
+    sub.extend(e.subcommand.iter().map(|s| at(Sx::Symbol(s.clone()))));
+    items.push(at(Sx::List(sub)));
+  }
+  if let Some(inner) = &e.inner {
+    let body = match inner {
+      Inner::Command(inner) => at(Sx::List(vec![
+        at(Sx::Symbol("command".into())),
+        show(inner),
+      ])),
+      Inner::Script(text) => at(Sx::List(vec![
+        at(Sx::Symbol("script".into())),
+        at(Sx::Str(text.clone())),
+      ])),
+    };
+    items.push(at(Sx::List(vec![at(Sx::Symbol("inner".into())), body])));
+  }
+  let mut list = vec![name.unwrap_or_else(|| at(Sx::Symbol("_".into())))];
+  list.extend(items);
+  at(Sx::List(list))
 }
 
 // --- condition checks ---
@@ -522,7 +693,41 @@ mod tests {
     );
     assert_eq!(
       failures("(check \"a\" matches \"a\")"),
-      ["t.scm:1:8: expected a [pattern] or a (condition)"]
+      ["t.scm:1:12: unknown elaboration verb `matches`"]
+    );
+    assert_eq!(
+      failures("(check 5 matches \"a\")"),
+      ["t.scm:1:8: expected a [pattern], a (condition), or a \"command\""]
+    );
+    assert_eq!(
+      failures(r#"(check "git -C ." elaborates (git))"#),
+      [r#"t.scm:1:1: expected (git), got (git "-C" ".")"#]
+    );
+    assert_eq!(
+      failures("(check \"a\" elaborates (a) (b))"),
+      ["t.scm:1:1: `elaborates` takes one expected form"]
+    );
+    assert_eq!(
+      failures("(check [a] matches \"a\" :commands)"),
+      ["t.scm:1:24: `:commands` needs a list of (command ...) forms"]
+    );
+    assert_eq!(
+      failures("(check [a] matches \"a\" :commands x)"),
+      ["t.scm:1:34: `:commands` takes a list of (command ...) forms"]
+    );
+    assert_eq!(
+      failures(
+        "(check [a] matches \"a\" :commands ((rule r (deny [a] :reason \"r\" :instead \"i\"))))"
+      ),
+      ["t.scm:1:35: `:commands` takes (command ...) forms, not rules"]
+    );
+    assert_eq!(
+      failures("(check [a] matches \"a\" :commands ((command a (option \"C\"))))"),
+      ["t.scm:1:54: option names look like \"-c\" or \"--long\", not \"C\""]
+    );
+    assert_eq!(
+      failures("(check [a] matches \"a\" :commands () extra)"),
+      ["t.scm:1:37: unexpected `extra` after `:commands`"]
     );
     assert_eq!(
       failures("(check [a] matches a)"),

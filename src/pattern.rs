@@ -36,7 +36,9 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::input::string_id;
-use crate::segment::{Redirect, RedirectKind, SimpleCommand, Word};
+#[cfg(test)]
+use crate::segment::SimpleCommand;
+use crate::segment::{Redirect, RedirectKind, Word};
 
 /// A pattern. Build one with [`Pattern::from_tokens`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,7 +123,9 @@ impl Pattern {
   /// Every distinct way the pattern matches `command` with no declaration
   /// in force: each word is one unit, and a dash word is an option unit.
   /// Empty means no match. A binder that appears twice must capture the
-  /// same word both times.
+  /// same word both times. The engine elaborates first and uses
+  /// [`Pattern::bindings_in`]; this is for tests.
+  #[cfg(test)]
   pub fn bindings(
     &self,
     command: &SimpleCommand,

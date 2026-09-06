@@ -25,7 +25,7 @@ use std::process::ExitCode;
 
 use color_eyre::config::{HookBuilder, Theme};
 use color_eyre::eyre::{Result, WrapErr, bail};
-use log::Writer as _;
+use log::{Reader as _, Writer as _};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -34,7 +34,8 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 const LOG_ENV: &str = "CLAUDE_GUARD_LOG";
 
 const USAGE: &str = "usage: claude-guard <hook|session-start>  (reads hook JSON on stdin)\n       \
-                     claude-guard rules [--export]     (check the rules in force, or print the built-in file)";
+                     claude-guard rules [--export]     (check the rules in force, or print the built-in file)\n       \
+                     claude-guard elaborate --check-log (round-trip every logged command through the elaborator)";
 
 fn main() -> ExitCode {
   fail_open(|| {
@@ -85,6 +86,7 @@ fn run(args: &[String]) -> Result<()> {
     "hook" => hook(&stdin()?),
     "session-start" => session_start(&stdin()?),
     "rules" => rules_command(rest),
+    "elaborate" => elaborate_command(rest),
     other => {
       eprintln!("{USAGE}");
       bail!("unknown subcommand {other:?}");
@@ -132,6 +134,66 @@ fn rules_command(args: &[String]) -> Result<()> {
       bail!("unknown arguments to `rules`");
     }
   }
+}
+
+/// `elaborate --check-log` runs every Bash command in every session log
+/// through the segmenter and the elaborator under the declarations in
+/// force, and prints each one whose words do not come back whole. The
+/// partition property (D22) is checked on live data, not only on the
+/// fixture. The exit code stays zero; the output is the report.
+fn elaborate_command(args: &[String]) -> Result<()> {
+  let [flag] = args else {
+    eprintln!("{USAGE}");
+    bail!("`elaborate` takes --check-log");
+  };
+  if flag != "--check-log" {
+    eprintln!("{USAGE}");
+    bail!("unknown arguments to `elaborate`");
+  }
+  let rules = match rules::Ruleset::load() {
+    Ok(rules) => rules,
+    Err(e) => {
+      eprintln!("{e}");
+      return Ok(());
+    }
+  };
+  let store = log::Store::from_env()?;
+  let mut checked = 0usize;
+  let mut failed = 0usize;
+  let mut skipped = 0usize;
+  for session_id in store.session_ids()? {
+    for record in store.session(&session_id)? {
+      let log::Subject::Bash {
+        command,
+        parse_error: None,
+        ..
+      } = &record.subject
+      else {
+        continue;
+      };
+      let Ok(segments) = segment::segment(command.as_str()) else {
+        skipped += 1;
+        continue;
+      };
+      for simple in &segments.commands {
+        checked += 1;
+        let elaborated = rules.declarations.elaborate(simple);
+        let back = elaborated.flatten();
+        if back != simple.words {
+          failed += 1;
+          let id = record
+            .tool_use_id
+            .as_ref()
+            .map_or("-".to_string(), ToString::to_string);
+          println!("{session_id} {id}: {command}");
+          println!("  words:     {:?}", simple.words);
+          println!("  flattened: {back:?}");
+        }
+      }
+    }
+  }
+  println!("{checked} commands checked, {failed} did not round-trip, {skipped} no longer segment");
+  Ok(())
 }
 
 /// Hook handler for every event. The event name in the payload decides:

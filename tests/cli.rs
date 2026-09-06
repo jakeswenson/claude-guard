@@ -398,6 +398,36 @@ fn user_command_declarations_are_counted_and_checked() {
 }
 
 #[test]
+fn elaborate_check_log_round_trips_every_logged_command() {
+  let state = state_dir();
+  for command in [
+    "git -C . stash",
+    "sudo -u root sed -i s/a/b/ f",
+    "cargo nextest run",
+  ] {
+    guard_logging_to(state.path())
+      .arg("hook")
+      .write_stdin(bash_call(command))
+      .assert()
+      .code(0);
+  }
+  guard_logging_to(state.path())
+    .env("XDG_CONFIG_HOME", state_dir().path())
+    .arg("elaborate")
+    .arg("--check-log")
+    .assert()
+    .code(0)
+    .stdout("3 commands checked, 0 did not round-trip, 0 no longer segment\n");
+
+  guard()
+    .arg("elaborate")
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains("--check-log"));
+}
+
+#[test]
 fn session_start_with_garbage_stdin_exits_zero() {
   guard()
     .arg("session-start")

@@ -309,6 +309,26 @@ impl Store {
   ) -> PathBuf {
     self.sessions.join(format!("{session_id}.jsonl"))
   }
+
+  /// Every session with a file, in name order. A missing sessions
+  /// directory is no sessions.
+  pub fn session_ids(&self) -> Result<Vec<SessionId>> {
+    let entries = match fs::read_dir(&self.sessions) {
+      Ok(entries) => entries,
+      Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+      Err(e) => return Err(e).wrap_err_with(|| format!("read {}", self.sessions.display())),
+    };
+    let mut ids: Vec<SessionId> = entries
+      .filter_map(|e| e.ok().map(|e| e.path()))
+      .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+      .filter_map(|p| {
+        p.file_stem()
+          .map(|s| SessionId::from(s.to_string_lossy().as_ref()))
+      })
+      .collect();
+    ids.sort();
+    Ok(ids)
+  }
 }
 
 fn resolve_state_dir(
