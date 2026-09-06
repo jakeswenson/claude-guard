@@ -22,6 +22,13 @@
 (check [echo "hi there"] matches "echo 'hi there'")
 (check [echo "hi there"] misses  "echo hi there")
 
+;; An assignment-shaped word after the command name is an ordinary word.
+;; Before the name it is an environment assignment and never reaches
+;; the matcher.
+(check [ssh -o ConnectTimeout=10 nas] matches "ssh -o ConnectTimeout=10 nas")
+(check [make CC=clang all]           matches "make CC=clang all")
+(check [make all]                    matches "CC=clang make all")
+
 ;; --- * takes exactly one word ---
 
 (check [git *] matches "git stash")

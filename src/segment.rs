@@ -109,6 +109,14 @@ pub fn segment(command: &str) -> Result<Segments, SegmentError> {
 
 /// Accumulates commands while descending the AST. Every `word` call goes
 /// through [`Walker::fold`], which is where substitutions get reported.
+/// Whether an item came before or after the command name. An
+/// assignment-shaped word means different things on each side.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Position {
+  Prefix,
+  Suffix,
+}
+
 struct Walker {
   options: ParserOptions,
   out: Segments,
@@ -234,13 +242,13 @@ impl Walker {
     let prefix = simple.prefix.iter().flat_map(|p| &p.0);
     let suffix = simple.suffix.iter().flat_map(|s| &s.0);
     for item in prefix {
-      self.item(item, &mut entry, &mut nested)?;
+      self.item(item, Position::Prefix, &mut entry, &mut nested)?;
     }
     if let Some(name) = &simple.word_or_name {
       entry.words.push(self.fold(name)?);
     }
     for item in suffix {
-      self.item(item, &mut entry, &mut nested)?;
+      self.item(item, Position::Suffix, &mut entry, &mut nested)?;
     }
     self.emit(entry, nested)
   }
@@ -248,6 +256,7 @@ impl Walker {
   fn item(
     &mut self,
     item: &ast::CommandPrefixOrSuffixItem,
+    position: Position,
     entry: &mut SimpleCommand,
     nested: &mut Vec<ast::SubshellCommand>,
   ) -> Result<(), SegmentError> {
@@ -255,21 +264,33 @@ impl Walker {
     match item {
       Item::Word(w) => entry.words.push(self.fold(w)?),
       Item::IoRedirect(redirect) => self.redirect(redirect, entry, nested)?,
-      // `FOO=bar cmd`: the assignment is dropped, but its value may
-      // hold a substitution worth reporting.
-      Item::AssignmentWord(assignment, _) => match &assignment.value {
-        ast::AssignmentValue::Scalar(w) => {
-          self.fold(w)?;
-        }
-        ast::AssignmentValue::Array(elements) => {
-          for (key, value) in elements {
-            if let Some(key) = key {
-              self.fold(key)?;
+      // Before the name, `FOO=bar cmd` is an environment assignment: the
+      // word is dropped, but its value may hold a substitution worth
+      // reporting. After the name, `make CC=clang` and
+      // `ssh -o ConnectTimeout=10` are ordinary words the command sees,
+      // and the parser only marked them because of their shape.
+      Item::AssignmentWord(assignment, _) => {
+        let value = match &assignment.value {
+          ast::AssignmentValue::Scalar(w) => Some(self.fold(w)?),
+          ast::AssignmentValue::Array(elements) => {
+            for (key, value) in elements {
+              if let Some(key) = key {
+                self.fold(key)?;
+              }
+              self.fold(value)?;
             }
-            self.fold(value)?;
+            None
           }
+        };
+        if position == Position::Suffix {
+          let name = assignment.name.to_string();
+          let op = if assignment.append { "+=" } else { "=" };
+          entry.words.push(match value {
+            Some(Word::Literal(text)) => Word::Literal(format!("{name}{op}{text}")),
+            Some(Word::Dynamic(_)) | None => Word::Dynamic(assignment.to_string()),
+          });
         }
-      },
+      }
       Item::ProcessSubstitution(kind, subshell) => {
         entry
           .words
@@ -624,6 +645,32 @@ mod tests {
     assert_eq!(segment("X=1").unwrap(), Segments::default());
     assert_eq!(segment("").unwrap(), Segments::default());
     assert_eq!(segment("# just a comment").unwrap(), Segments::default());
+  }
+
+  #[test]
+  fn an_assignment_shaped_word_after_the_name_is_kept() {
+    assert_eq!(
+      commands("ssh -o ConnectTimeout=10 nas"),
+      vec![cmd(&["ssh", "-o", "ConnectTimeout=10", "nas"])]
+    );
+    assert_eq!(
+      commands("make CC=clang all"),
+      vec![cmd(&["make", "CC=clang", "all"])]
+    );
+    assert_eq!(
+      commands("export PATH+=:/x"),
+      vec![cmd(&["export", "PATH+=:/x"])]
+    );
+    // A value the shell would expand keeps the whole word dynamic.
+    assert_eq!(
+      commands("make CC=$CC"),
+      vec![SimpleCommand {
+        words: vec![lit("make"), dynamic("CC=$CC")],
+        redirects: vec![],
+      }]
+    );
+    // Before the name it is still an environment assignment, and dropped.
+    assert_eq!(commands("CC=clang make all"), vec![cmd(&["make", "all"])]);
   }
 
   #[test]
