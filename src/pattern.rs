@@ -29,7 +29,7 @@
 //! the Rust table uses, and [`Pattern::from_tokens`] takes tokens the rule
 //! file syntax already split. Both match the same way.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -154,6 +154,19 @@ impl Pattern {
       words,
       redirects,
     }
+  }
+
+  /// Every binder the pattern declares, in words and redirect targets.
+  pub fn binders(&self) -> BTreeSet<Var> {
+    self
+      .words
+      .iter()
+      .chain(self.redirects.iter().map(|r| &r.target))
+      .filter_map(|token| match token {
+        Token::Var(var) => Some(var.clone()),
+        _ => None,
+      })
+      .collect()
   }
 
   /// True when every pattern word and redirect finds its counterpart on

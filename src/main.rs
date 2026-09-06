@@ -6,6 +6,7 @@
 //! - stdout carries a decision only when a rule speaks
 //! - stderr carries diagnostics, visible with `claude --debug`
 
+mod cond;
 mod input;
 mod log;
 mod output;

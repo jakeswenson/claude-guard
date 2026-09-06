@@ -158,6 +158,13 @@ on")*
   decision for later. *(their words: "should a rule that doesn't bind for
   reasons like this (had a dynamic word) be logged/tracked so that the
   reason a rule didn't match is inspectable?")*
+- **D21** — `under?` resolves a relative path against the call's cwd
+  before comparing, so `echo hi > x` in `/tmp` is under `/tmp`. The Rust
+  table's `/tmp/**` token left relative paths alone because the matcher
+  has no cwd; the condition has one. When cwd tracking (D13) lands, the
+  cwd here becomes the tracked one. A rule's `:when` cannot use binders,
+  since it runs before any pattern matches; the checker says so in the
+  error. Made in step 3 and written here the same day.
 
 ## Scope: first version
 

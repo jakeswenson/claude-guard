@@ -18,7 +18,8 @@
 //! belong in the condition, as `(under? ?p "/tmp")`.
 //!
 //! `:instead` is required on deny and ask, optional on warn. A condition
-//! is kept as written; its meaning arrives with the evaluator.
+//! is checked by [`cond`] against the binders its pattern declares; a
+//! rule's `:when` may use none.
 //!
 //! Every error names the node it is about. Top-level forms are checked
 //! independently, so one load reports every rule that is wrong.
@@ -26,8 +27,10 @@
 // Used by the loader, which lands in claude-guard-110.4.
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::cond::{self, Cond, Scope};
 use crate::pattern::{Pattern, RedirectPattern, Token, Var};
 use crate::rules::{Kind, RuleName};
 use crate::segment::RedirectKind;
@@ -84,10 +87,18 @@ pub enum PathArg {
   Var(Var),
 }
 
-/// A condition as written. The evaluator gives it meaning.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Cond {
-  pub node: Node,
+impl Subject {
+  /// The binders a condition on this subject may use.
+  pub fn binders(&self) -> BTreeSet<Var> {
+    match self {
+      Subject::Command(pattern) => pattern.binders(),
+      Subject::Tool(ToolPattern {
+        path: PathArg::Var(var),
+        ..
+      }) => BTreeSet::from([var.clone()]),
+      Subject::Tool(_) => BTreeSet::new(),
+    }
+  }
 }
 
 /// The tree does not describe a rule. The span names the node at fault.
@@ -167,9 +178,7 @@ fn parse_rule(form: &Node) -> Result<Rule, TypeError> {
         if when.is_some() {
           return err(item.span, "`:when` given twice");
         }
-        when = Some(Cond {
-          node: value.clone(),
-        });
+        when = Some(cond::parse(value, &Scope::Rule)?);
         i += 2;
       }
       Sx::Keyword(key) => return err(item.span, format!("unknown keyword `:{key}` in rule")),
@@ -224,6 +233,7 @@ fn parse_row(node: &Node) -> Result<Row, TypeError> {
     return err(node.span, format!("`{head_name}` needs a pattern"));
   };
   let subject = parse_subject(subject_node)?;
+  let scope = Scope::Row(subject.binders());
 
   let mut when = None;
   let mut reason = None;
@@ -238,13 +248,7 @@ fn parse_row(node: &Node) -> Result<Row, TypeError> {
       return err(item.span, format!("`:{key}` needs a value"));
     };
     match key.as_str() {
-      "when" => set_once(
-        &mut when,
-        item,
-        Cond {
-          node: value.clone(),
-        },
-      )?,
+      "when" => set_once(&mut when, item, cond::parse(value, &scope)?)?,
       "reason" => set_once(&mut reason, item, string(item, value)?)?,
       "instead" => set_once(&mut instead, item, string(item, value)?)?,
       other => {
@@ -509,11 +513,17 @@ mod tests {
   }
 
   #[test]
-  fn a_rule_condition_is_kept_as_written() {
+  fn a_rule_condition_is_checked_with_no_binders() {
     let file = file(TABLE);
-    let when = file.rules[1].when.as_ref().unwrap();
-    assert_eq!(when.node.to_string(), "(ancestor-has? \".jj\")");
-    assert_eq!(when.node.span, Span { line: 9, col: 27 });
+    assert_eq!(file.rules[1].when, Some(Cond::AncestorHas(".jj".into())));
+    assert_eq!(
+      error("(rule x :when (under? ?p \"/tmp\") (deny [a ?p] :reason \"r\" :instead \"i\"))"),
+      "1:23: `?p` is not bound: a rule `:when` runs before any pattern matches"
+    );
+    assert_eq!(
+      error("(rule x :when (nope) (deny [a] :reason \"r\" :instead \"i\"))"),
+      "1:16: unknown predicate `nope`"
+    );
   }
 
   #[test]
@@ -538,12 +548,32 @@ mod tests {
   }
 
   #[test]
-  fn a_row_condition_is_kept_as_written() {
-    let file = file(TABLE);
-    let row = &file.rules[2].rows[0];
+  fn a_row_condition_is_checked_against_its_pattern_binders() {
+    let table = file(TABLE);
+    let row = &table.rules[2].rows[0];
     assert_eq!(
-      row.when.as_ref().unwrap().node.to_string(),
-      "(under? ?out \"/tmp\")"
+      row.when,
+      Some(Cond::Under(
+        cond::Arg::Var(Var::from("out")),
+        std::path::PathBuf::from("/tmp")
+      ))
+    );
+    // Binders come from words, redirect targets, and tool paths.
+    file(
+      "(rule x (deny [cp ?a > ?b] :when (and (under? ?a \"/\") (under? ?b \"/\")) :reason \"r\" :instead \"i\"))",
+    );
+    file("(rule x (deny (edit ?p) :when (under? ?p \"/\") :reason \"r\" :instead \"i\"))");
+    assert_eq!(
+      error(
+        "(rule x (deny [cp ?src *] :when (under? ?dst \"/tmp\") :reason \"r\" :instead \"i\"))"
+      ),
+      "1:41: `?dst` is not bound by this pattern"
+    );
+    assert_eq!(
+      error(
+        "(rule x (deny (write \"/x\") :when (under? ?p \"/tmp\") :reason \"r\" :instead \"i\"))"
+      ),
+      "1:42: `?p` is not bound by this pattern"
     );
   }
 
@@ -660,15 +690,20 @@ mod tests {
     assert_eq!(error("(rule)"), "1:1: rule needs a name");
     assert_eq!(error("(rule \"x\")"), "1:7: rule name must be a symbol");
     assert_eq!(error("(rule x)"), "1:1: rule `x` has no rows");
-    assert_eq!(error("(rule x :when (a))"), "1:1: rule `x` has no rows");
+    assert_eq!(
+      error("(rule x :when (ancestor-has? \".jj\"))"),
+      "1:1: rule `x` has no rows"
+    );
   }
 
   #[test]
   fn a_rule_condition_is_given_once_with_a_value() {
     assert_eq!(error("(rule x :when)"), "1:9: `:when` needs a condition");
     assert_eq!(
-      error("(rule x :when (a) :when (b) (deny [a] :reason \"r\" :instead \"i\"))"),
-      "1:19: `:when` given twice"
+      error(
+        "(rule x :when (ancestor-has? \".jj\") :when (ancestor-has? \".git\") (deny [a] :reason \"r\" :instead \"i\"))"
+      ),
+      "1:37: `:when` given twice"
     );
     assert_eq!(
       error("(rule x :foo 1)"),
