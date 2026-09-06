@@ -12,7 +12,6 @@ mod load;
 mod log;
 mod output;
 mod pattern;
-mod repo;
 mod rules;
 mod segment;
 mod sexp;
@@ -33,12 +32,14 @@ use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 /// `claude_guard=trace`. Unset means `warn`.
 const LOG_ENV: &str = "CLAUDE_GUARD_LOG";
 
-const USAGE: &str = "usage: claude-guard <hook|session-start>  (reads hook JSON on stdin)";
+const USAGE: &str = "usage: claude-guard <hook|session-start>  (reads hook JSON on stdin)\n       \
+                     claude-guard rules [--export]     (check the rules in force, or print the built-in file)";
 
 fn main() -> ExitCode {
   fail_open(|| {
     install_diagnostics()?;
-    run(std::env::args().nth(1).as_deref())
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    run(&args)
   })
 }
 
@@ -71,25 +72,62 @@ fn chain(report: &color_eyre::Report) -> String {
     .join(": ")
 }
 
-/// Dispatch on the subcommand. Stdin is read here, once, so both
-/// subcommands see the same input type later.
-fn run(subcommand: Option<&str>) -> Result<()> {
-  let Some(subcommand) = subcommand else {
+/// Dispatch on the subcommand. The hook subcommands read stdin once;
+/// `rules` never touches it.
+fn run(args: &[String]) -> Result<()> {
+  let Some((subcommand, rest)) = args.split_first() else {
     eprintln!("{USAGE}");
     bail!("no subcommand given");
   };
 
+  match subcommand.as_str() {
+    "hook" => hook(&stdin()?),
+    "session-start" => session_start(&stdin()?),
+    "rules" => rules_command(rest),
+    other => {
+      eprintln!("{USAGE}");
+      bail!("unknown subcommand {other:?}");
+    }
+  }
+}
+
+fn stdin() -> Result<String> {
   let mut input = String::new();
   std::io::stdin()
     .read_to_string(&mut input)
     .wrap_err("read hook input from stdin")?;
+  Ok(input)
+}
 
-  match subcommand {
-    "hook" => hook(&input),
-    "session-start" => session_start(&input),
-    other => {
+/// `rules` checks the rules in force and says where they came from;
+/// `rules --export` prints the built-in file as a starting point for a
+/// user file. A file that does not load prints its problems, one per
+/// line, and the exit code stays zero like everything else.
+fn rules_command(args: &[String]) -> Result<()> {
+  match args {
+    [] => match rules::Ruleset::load() {
+      Ok(rules) => {
+        let rows: usize = rules.rules().iter().map(|r| r.rows.len()).sum();
+        println!(
+          "{}: {} rules, {} rows",
+          rules.source,
+          rules.rules().len(),
+          rows
+        );
+        Ok(())
+      }
+      Err(e) => {
+        eprintln!("{e}");
+        Ok(())
+      }
+    },
+    [flag] if flag == "--export" => {
+      print!("{}", load::BUILTIN);
+      Ok(())
+    }
+    _ => {
       eprintln!("{USAGE}");
-      bail!("unknown subcommand {other:?}");
+      bail!("unknown arguments to `rules`");
     }
   }
 }
@@ -118,16 +156,26 @@ fn session_start(raw: &str) -> Result<()> {
   observe(&envelope)
 }
 
-/// Parse, build the context, evaluate, log, print.
+/// Load the rules, parse, build the context, evaluate, log, print.
+///
+/// A rule file that does not load is every problem on stderr, the call
+/// recorded as observed, and no decision: the guard never decides from a
+/// half-loaded table, and every call still leaves a record.
 ///
 /// The log is written before stdout so a crash while printing still
 /// leaves the record, and a log failure is one warning on stderr that
 /// changes nothing about the decision.
 fn pre_tool_use(raw: &str) -> Result<()> {
+  let rules = match rules::Ruleset::load() {
+    Ok(rules) => rules,
+    Err(e) => {
+      eprintln!("claude-guard: rules did not load; tool call proceeds\n{e}");
+      return observe(&input::envelope(raw)?);
+    }
+  };
   let input = input::parse(raw)?;
-  let rules = rules::Ruleset::builtin().wrap_err("compile built-in rules")?;
   let ctx = rules::Context::new(input);
-  let verdict = rules.evaluate(&ctx);
+  let verdict = rules.evaluate(&ctx, &cond::RealFs);
 
   record(log::Record::pre_tool_use(
     &ctx,

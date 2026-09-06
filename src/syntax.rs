@@ -24,9 +24,6 @@
 //! Every error names the node it is about. Top-level forms are checked
 //! independently, so one load reports every rule that is wrong.
 
-// Used by the loader, which lands in claude-guard-110.4.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -85,6 +82,37 @@ pub enum FileTool {
 pub enum PathArg {
   Literal(String),
   Var(Var),
+}
+
+impl fmt::Display for Subject {
+  /// The subject as written: `[git -... stash ...]` or `(write ?path)`.
+  fn fmt(
+    &self,
+    f: &mut fmt::Formatter<'_>,
+  ) -> fmt::Result {
+    match self {
+      Subject::Command(pattern) => write!(f, "{pattern}"),
+      Subject::Tool(tool) => write!(f, "{tool}"),
+    }
+  }
+}
+
+impl fmt::Display for ToolPattern {
+  fn fmt(
+    &self,
+    f: &mut fmt::Formatter<'_>,
+  ) -> fmt::Result {
+    let tool = match self.tool {
+      FileTool::Write => "write",
+      FileTool::Edit => "edit",
+      FileTool::MultiEdit => "multi-edit",
+      FileTool::Read => "read",
+    };
+    match &self.path {
+      PathArg::Literal(path) => write!(f, "({tool} {path:?})"),
+      PathArg::Var(var) => write!(f, "({tool} ?{var})"),
+    }
+  }
 }
 
 impl Subject {

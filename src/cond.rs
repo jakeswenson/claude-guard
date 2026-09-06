@@ -19,9 +19,6 @@
 //! `under?` resolves a relative path against the call's cwd before
 //! comparing, and `/private/tmp` counts as `/tmp`, as in the matcher.
 
-// Used by the loader, which lands in claude-guard-110.4.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

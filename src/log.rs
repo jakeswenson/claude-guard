@@ -21,6 +21,7 @@ use crate::input::{
   string_id,
 };
 use crate::output::Decision;
+use crate::pattern::Bindings;
 use crate::rules::{Context, PatternText, RuleName, Seen, Verdict};
 use crate::segment::SimpleCommand;
 
@@ -154,6 +155,10 @@ pub struct Record {
   pub outcome: Outcome,
   pub rule: Option<RuleName>,
   pub pattern: Option<PatternText>,
+  /// What the row's binders captured; `null` when no row fired. Absent
+  /// on lines written before it existed.
+  #[serde(default)]
+  pub bindings: Option<Bindings>,
   pub reason: Option<Reason>,
 }
 
@@ -185,6 +190,9 @@ impl Record {
       outcome,
       rule: verdict.map(|v| v.rule.clone()),
       pattern: verdict.and_then(|v| v.pattern.clone()),
+      bindings: verdict
+        .filter(|v| v.pattern.is_some())
+        .map(|v| v.bindings.clone()),
       reason,
     }
   }
@@ -209,6 +217,7 @@ impl Record {
       outcome: Outcome::Observed,
       rule: None,
       pattern: None,
+      bindings: None,
       reason: None,
     }
   }
@@ -424,6 +433,7 @@ mod tests {
   use super::*;
   use crate::input::HookInput;
   use crate::rules::Ruleset;
+  use crate::rules::testing::repo;
 
   fn at(rfc3339: &str) -> Timestamp {
     rfc3339.parse().unwrap()
@@ -433,16 +443,13 @@ mod tests {
     session: &str,
     tool: Tool,
   ) -> Context {
-    Context::with_repo(
-      HookInput {
-        session_id: session.into(),
-        cwd: "/Users/x/proj".into(),
-        tool_use_id: "toolu_1".into(),
-        agent_id: None,
-        tool,
-      },
-      false,
-    )
+    Context::new(HookInput {
+      session_id: session.into(),
+      cwd: "/Users/x/proj".into(),
+      tool_use_id: "toolu_1".into(),
+      agent_id: None,
+      tool,
+    })
   }
 
   fn bash(command: &str) -> Tool {
@@ -456,7 +463,7 @@ mod tests {
     tool: Tool,
   ) -> Record {
     let ctx = context(session, tool);
-    let verdict = Ruleset::builtin().unwrap().evaluate(&ctx);
+    let verdict = Ruleset::builtin().evaluate(&ctx, &repo(false));
     Record::pre_tool_use(&ctx, verdict.as_ref(), at("2026-09-05T10:00:00Z"))
   }
 
@@ -473,7 +480,7 @@ mod tests {
         r#""subject":{"bash":{"command":"git stash","#,
         r#""commands":[{"words":[{"literal":"git"},{"literal":"stash"}],"redirects":[]}],"#,
         r#""uninspected":[],"parse_error":null}},"#,
-        r#""outcome":"deny","rule":"hard-denies","pattern":"git -... stash ...","#,
+        r#""outcome":"deny","rule":"hard-denies","pattern":"[git -... stash ...]","bindings":{},"#,
         r#""reason":"claude-guard denied `git stash`: jj has no dirty tree, so there is nothing to stash. "#,
         r#"Instead: use `jj new` to park the current change or `jj describe` to name it."}"#,
       )
@@ -487,7 +494,8 @@ mod tests {
     assert_eq!((r.rule, r.pattern, r.reason), (None, None, None));
     let json = serde_json::to_string(&record("s1", bash("cargo build"))).unwrap();
     assert!(
-      json.ends_with(r#""outcome":"pass","rule":null,"pattern":null,"reason":null}"#),
+      json
+        .ends_with(r#""outcome":"pass","rule":null,"pattern":null,"bindings":null,"reason":null}"#),
       "{json}"
     );
   }

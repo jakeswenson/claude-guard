@@ -133,7 +133,8 @@ fn hook_writes_one_log_line_per_call_including_passes() {
   );
   assert_eq!(deny["outcome"], "deny");
   assert_eq!(deny["rule"], "hard-denies");
-  assert_eq!(deny["pattern"], "git -... stash ...");
+  assert_eq!(deny["pattern"], "[git -... stash ...]");
+  assert_eq!(deny["bindings"], serde_json::json!({}));
   assert!(
     deny["reason"]
       .as_str()
@@ -147,7 +148,123 @@ fn hook_writes_one_log_line_per_call_including_passes() {
   assert_eq!(pass["outcome"], "pass");
   assert_eq!(pass["rule"], serde_json::Value::Null);
   assert_eq!(pass["pattern"], serde_json::Value::Null);
+  assert_eq!(pass["bindings"], serde_json::Value::Null);
   assert_eq!(pass["reason"], serde_json::Value::Null);
+}
+
+#[test]
+fn a_binding_row_records_what_it_captured() {
+  let state = state_dir();
+  guard_logging_to(state.path())
+    .arg("hook")
+    .write_stdin(bash_call("cp -r dist /tmp/dist"))
+    .assert()
+    .code(0)
+    .stdout(predicate::str::contains("\"permissionDecision\":\"deny\""));
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let line: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+  assert_eq!(line["rule"], "tmp-writes");
+  assert_eq!(line["pattern"], "[cp ... ?dst]");
+  assert_eq!(line["bindings"], serde_json::json!({"dst": "/tmp/dist"}));
+}
+
+// --- the rule file ---
+
+#[test]
+fn a_user_rule_file_replaces_the_builtin_rules() {
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  fs::write(
+    &rules,
+    "(rule mine (deny [cargo -... clean ...] :reason \"slow.\" :instead \"do not.\"))",
+  )
+  .unwrap();
+  let mut command = guard_logging_to(state.path());
+  command.env("CLAUDE_GUARD_RULES", &rules);
+  command
+    .arg("hook")
+    .write_stdin(bash_call("cargo clean"))
+    .assert()
+    .code(0)
+    .stdout(predicate::str::contains(
+      "claude-guard denied `cargo clean`: slow. Instead: do not.",
+    ));
+
+  // The builtin git rule is gone with the builtin file.
+  let mut command = guard_logging_to(state.path());
+  command.env("CLAUDE_GUARD_RULES", &rules);
+  command
+    .arg("hook")
+    .write_stdin(bash_call("git stash"))
+    .assert()
+    .code(0)
+    .stdout("");
+}
+
+#[test]
+fn a_broken_rule_file_fails_open_and_still_leaves_a_record() {
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  fs::write(&rules, "(rule a)\n(rule b (deny [x]))").unwrap();
+  let mut command = guard_logging_to(state.path());
+  command.env("CLAUDE_GUARD_RULES", &rules);
+  command
+    .arg("hook")
+    .write_stdin(bash_call("git stash"))
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains(
+      "rules.scm:1:1: rule `a` has no rows",
+    ))
+    .stderr(predicate::str::contains(
+      "rules.scm:2:9: `deny` needs a :reason",
+    ));
+
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let line: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+  assert_eq!(line["event"], "pre_tool_use");
+  assert_eq!(line["outcome"], "observed");
+}
+
+#[test]
+fn rules_reports_the_source_in_force() {
+  guard()
+    .env("CLAUDE_GUARD_RULES", "")
+    .env_remove("CLAUDE_GUARD_RULES")
+    .env("XDG_CONFIG_HOME", state_dir().path())
+    .arg("rules")
+    .assert()
+    .code(0)
+    .stdout("built-in rules: 4 rules, 29 rows\n");
+
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  fs::write(&rules, "(rule a)").unwrap();
+  guard()
+    .env("CLAUDE_GUARD_RULES", &rules)
+    .arg("rules")
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains(
+      "rules.scm:1:1: rule `a` has no rows",
+    ));
+}
+
+#[test]
+fn rules_export_prints_the_builtin_file_verbatim() {
+  guard()
+    .arg("rules")
+    .arg("--export")
+    .assert()
+    .code(0)
+    .stdout(predicate::str::starts_with(
+      ";; claude-guard built-in rules.",
+    ))
+    .stdout(predicate::str::contains(
+      "(rule git-in-jj :when (ancestor-has? \".jj\")",
+    ));
 }
 
 #[test]

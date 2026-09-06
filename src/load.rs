@@ -15,9 +15,6 @@
 //! one `source:line:col: message` line per problem, so a broken file
 //! prints every problem in one run. The hook fails open on any of them.
 
-// Used by the engine, which switches over in claude-guard-110.6.
-#![allow(dead_code)]
-
 use std::env::var_os;
 use std::ffi::OsString;
 use std::fmt;

@@ -1,283 +1,89 @@
-//! The rule table and the engine that runs it.
+//! The engine that runs a rule table against one tool call.
 //!
-//! A rule is plain data: a name, a condition, a decision kind, and rows of
-//! (subject, guidance). A subject is a command pattern from [`pattern`] or a
-//! path prefix for the file tools. Guidance is a reason and an alternative,
-//! rendered together so the model always learns what to do instead.
+//! The table comes from a rule file, see [`load`]; the engine holds no
+//! rules of its own. Evaluation order is fixed: a command the parser
+//! rejects asks the user; then rules in file order, rows in rule order,
+//! first opinion wins; then, when nothing spoke, a warning about any
+//! `$(...)` text the segmenter could not inspect.
 //!
-//! Evaluation order is fixed: a command the parser rejects asks the user;
-//! then rules in table order, first opinion wins; then, when nothing spoke,
-//! a warning about any `$(...)` text the segmenter could not inspect.
+//! A row fires when its subject matches and its condition holds under
+//! some binding set the match produced. A rule's own `:when` is checked
+//! once, before its rows. An unknown condition does not fire a row in
+//! this version.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::cond::{self, Env, Fs, Truth};
 use crate::input::{HookInput, Tool, string_id};
+use crate::load::{self, LoadError, Loaded, Source};
 use crate::output::Decision;
-use crate::pattern::{self, Pattern, PatternError};
-use crate::repo;
+use crate::pattern::{self, Bindings};
 use crate::segment::{self, RedirectKind, SegmentError, Segments, SimpleCommand, Word};
+use crate::syntax::{FileTool, PathArg, Row, Rule, Subject};
 
-/// One row of the built-in table.
-pub struct Rule {
-  pub name: &'static str,
-  pub when: When,
-  pub decision: Kind,
-  /// Checked in order; the first subject that matches supplies the guidance.
-  pub subjects: &'static [(Subject, Guidance)],
-}
-
+/// A row's decision kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum When {
-  Always,
-  InJjRepo,
-}
-
-/// The table has only deny rows today. Ask and Warn wait for a row that
-/// needs them; the engine already renders all three.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Kind {
   Deny,
   Ask,
   Warn,
 }
 
-pub enum Subject {
-  /// A pattern in the [`pattern`] language, matched against every simple
-  /// command in a Bash call.
-  Command(&'static str),
-  /// A path prefix, matched against the file path of Write, Edit, and
-  /// MultiEdit. `/tmp` and `/private/tmp` are the same place.
-  FileUnder(&'static str),
-}
-
-/// Why a call is stopped and what to do instead.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Guidance {
-  pub reason: &'static str,
-  pub instead: &'static str,
-}
-
-const fn say(
-  reason: &'static str,
-  instead: &'static str,
-) -> Guidance {
-  Guidance { reason, instead }
-}
-
-const NO_TMP: Guidance = say(
-  "no files under /tmp.",
-  "write inside the project, or use a test or an example.",
-);
-
-const JJ_REPO: &str = "this repo is managed by jj.";
-
-/// The built-in table, in evaluation order. Warn rules go last so a warn
-/// never shadows a deny on the same command.
-pub const RULES: &[Rule] = &[
-  Rule {
-    name: "hard-denies",
-    when: When::Always,
-    decision: Kind::Deny,
-    subjects: &[
-      (
-        Subject::Command("git -... worktree ..."),
-        say(
-          "git worktrees are banned here.",
-          "use `jj workspace add`, and ask the user before creating one.",
-        ),
-      ),
-      (
-        Subject::Command("git -... stash ..."),
-        say(
-          "jj has no dirty tree, so there is nothing to stash.",
-          "use `jj new` to park the current change or `jj describe` to name it.",
-        ),
-      ),
-      (
-        Subject::Command("git -... checkout ..."),
-        say(
-          "checkout moves a git HEAD that jj does not track.",
-          "use `jj edit <rev>` or `jj new <rev>`.",
-        ),
-      ),
-      (
-        Subject::Command("sed ..."),
-        say(
-          "sed is banned.",
-          "use `sd` for replacements, `rg` for searching, or the Edit tool.",
-        ),
-      ),
-      (
-        Subject::Command("chezmoi -... apply ..."),
-        say(
-          "chezmoi apply changes the live dotfiles and is never run from a session.",
-          "show the diff with `chezmoi diff` and let the user apply.",
-        ),
-      ),
-      (
-        Subject::Command("cat ... > *"),
-        say(
-          "writing files through a cat redirect is banned.",
-          "use the Write tool.",
-        ),
-      ),
-    ],
-  },
-  Rule {
-    name: "git-in-jj",
-    when: When::InJjRepo,
-    decision: Kind::Deny,
-    subjects: &[
-      (
-        Subject::Command("git -... log ..."),
-        say(JJ_REPO, "use `jj log`."),
-      ),
-      (
-        Subject::Command("git -... status ..."),
-        say(JJ_REPO, "use `jj status`."),
-      ),
-      (
-        Subject::Command("git -... diff ..."),
-        say(JJ_REPO, "use `jj diff`."),
-      ),
-      (
-        Subject::Command("git -... show ..."),
-        say(JJ_REPO, "use `jj show`."),
-      ),
-      (
-        Subject::Command("git -... blame ..."),
-        say(JJ_REPO, "use `jj file annotate`."),
-      ),
-      (
-        Subject::Command("git -... add ..."),
-        say(JJ_REPO, "nothing; jj tracks new files on its own."),
-      ),
-      (
-        Subject::Command("git -... commit ..."),
-        say(JJ_REPO, "use `jj commit` or `jj describe`."),
-      ),
-      (
-        Subject::Command("git -... push ..."),
-        say(JJ_REPO, "use `jj git push`."),
-      ),
-      (
-        Subject::Command("git -... pull ..."),
-        say(JJ_REPO, "use `jj git fetch`, then `jj rebase`."),
-      ),
-      (
-        Subject::Command("git -... fetch ..."),
-        say(JJ_REPO, "use `jj git fetch`."),
-      ),
-      (
-        Subject::Command("git -... rebase ..."),
-        say(JJ_REPO, "use `jj rebase`."),
-      ),
-      (
-        Subject::Command("git -... branch ..."),
-        say(JJ_REPO, "use `jj bookmark`."),
-      ),
-      (
-        Subject::Command("git ..."),
-        say(
-          JJ_REPO,
-          "use the jj equivalent, or `jj git <subcommand>` for remote operations.",
-        ),
-      ),
-    ],
-  },
-  Rule {
-    name: "tmp-writes",
-    when: When::Always,
-    decision: Kind::Deny,
-    subjects: &[
-      (Subject::Command("... > /tmp/**"), NO_TMP),
-      (Subject::Command("tee ... /tmp/**"), NO_TMP),
-      (
-        Subject::Command("mktemp ..."),
-        say(
-          "mktemp creates files under /tmp.",
-          "write inside the project, or use a test or an example.",
-        ),
-      ),
-      (Subject::Command("cp ... /tmp/**"), NO_TMP),
-      (Subject::Command("mv ... /tmp/**"), NO_TMP),
-      (Subject::FileUnder("/tmp"), NO_TMP),
-    ],
-  },
-  Rule {
-    name: "tool-nudges",
-    when: When::Always,
-    decision: Kind::Deny,
-    subjects: &[
-      (
-        Subject::Command("grep ..."),
-        say("grep is not the search tool here.", "use `rg`."),
-      ),
-      (
-        Subject::Command("find ..."),
-        say("find is not the file finder here.", "use `fd`."),
-      ),
-    ],
-  },
-];
-
 /// Everything the engine knows about one tool call. Built once in `hook`.
 #[derive(Debug)]
 pub struct Context {
   pub input: HookInput,
   pub seen: Seen,
-  pub in_jj_repo: bool,
 }
 
 /// The part of the tool input the rules look at.
 #[derive(Debug)]
 pub enum Seen {
   Bash(Result<Segments, SegmentError>),
-  File(PathBuf),
+  File { tool: FileTool, path: PathBuf },
   Other,
 }
 
 impl Context {
-  /// Segment the command and look for a jj repo around `cwd`.
+  /// Segment a Bash command, or note the file a file tool touches.
   pub fn new(input: HookInput) -> Context {
-    let in_jj_repo = repo::in_jj_repo(input.cwd.as_ref());
-    Context::with_repo(input, in_jj_repo)
-  }
-
-  /// Like [`Context::new`] with the repo answer supplied, for tests.
-  pub fn with_repo(
-    input: HookInput,
-    in_jj_repo: bool,
-  ) -> Context {
     let seen = match &input.tool {
       Tool::Bash { command } => Seen::Bash(segment::segment(command)),
-      Tool::Write { path } | Tool::Edit { path } | Tool::MultiEdit { path } => {
-        Seen::File(path.clone())
-      }
-      Tool::Read { .. }
-      | Tool::WebFetch { .. }
+      Tool::Write { path } => Seen::File {
+        tool: FileTool::Write,
+        path: path.clone(),
+      },
+      Tool::Edit { path } => Seen::File {
+        tool: FileTool::Edit,
+        path: path.clone(),
+      },
+      Tool::MultiEdit { path } => Seen::File {
+        tool: FileTool::MultiEdit,
+        path: path.clone(),
+      },
+      Tool::Read { path } => Seen::File {
+        tool: FileTool::Read,
+        path: path.clone(),
+      },
+      Tool::WebFetch { .. }
       | Tool::Glob { .. }
       | Tool::Grep { .. }
       | Tool::Mcp { .. }
       | Tool::Other { .. } => Seen::Other,
     };
-    Context {
-      input,
-      seen,
-      in_jj_repo,
-    }
+    Context { input, seen }
   }
 }
 
 string_id! {
-  /// A rule's name from the table, or `parse-error` and `uninspected` for
+  /// A rule's name from the file, or `parse-error` and `uninspected` for
   /// the two answers the engine gives on its own.
   RuleName
 }
 
 string_id! {
-  /// The text of the subject that fired: a pattern, or a path prefix.
+  /// The subject that fired, as written in the file: `[git -... stash ...]`
+  /// or `(write ?path)`.
   PatternText
 }
 
@@ -285,85 +91,78 @@ string_id! {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
   pub rule: RuleName,
-  /// `None` for the engine's own answers, which have no table row.
+  /// `None` for the engine's own answers, which have no row.
   pub pattern: Option<PatternText>,
+  /// What the row's binders captured. Empty when the row has none.
+  pub bindings: Bindings,
   pub decision: Decision,
 }
 
-/// The table with every pattern parsed.
+/// A loaded rule table, ready to evaluate.
 pub struct Ruleset {
-  rules: Vec<Compiled>,
-}
-
-struct Compiled {
-  name: &'static str,
-  when: When,
-  decision: Kind,
-  subjects: Vec<(Matcher, Guidance)>,
-}
-
-enum Matcher {
-  Command(Pattern),
-  FileUnder(PathBuf),
+  pub source: Source,
+  rules: Vec<Rule>,
 }
 
 impl Ruleset {
-  /// Compile [`RULES`]. Fails on the first pattern that does not parse.
-  pub fn builtin() -> Result<Ruleset, PatternError> {
-    Ruleset::compile(RULES)
+  /// The rules in force, per [`load`].
+  pub fn load() -> Result<Ruleset, LoadError> {
+    load::from_env().map(Ruleset::from)
   }
 
-  pub fn compile(rules: &[Rule]) -> Result<Ruleset, PatternError> {
-    let rules = rules
-      .iter()
-      .map(|rule| {
-        let subjects = rule
-          .subjects
-          .iter()
-          .map(|(subject, guidance)| {
-            let matcher = match subject {
-              Subject::Command(source) => Matcher::Command(Pattern::parse(source)?),
-              Subject::FileUnder(prefix) => Matcher::FileUnder(PathBuf::from(prefix)),
-            };
-            Ok((matcher, *guidance))
-          })
-          .collect::<Result<_, _>>()?;
-        Ok(Compiled {
-          name: rule.name,
-          when: rule.when,
-          decision: rule.decision,
-          subjects,
-        })
-      })
-      .collect::<Result<_, _>>()?;
-    Ok(Ruleset { rules })
+  /// The rules shipped with the binary, for tests. The hook goes through
+  /// [`Ruleset::load`] so a user file can replace them.
+  #[cfg(test)]
+  pub fn builtin() -> Ruleset {
+    load::load_text(Source::Builtin, load::BUILTIN)
+      .map(Ruleset::from)
+      .expect("the built-in rule file type-checks; a test guards this")
+  }
+
+  /// A table from text, for tests.
+  #[cfg(test)]
+  pub fn from_text(text: &str) -> Result<Ruleset, LoadError> {
+    load::load_text(Source::Builtin, text).map(Ruleset::from)
+  }
+
+  pub fn rules(&self) -> &[Rule] {
+    &self.rules
   }
 
   /// First opinion wins. `None` means the call proceeds untouched.
   pub fn evaluate(
     &self,
     ctx: &Context,
+    fs: &dyn Fs,
   ) -> Option<Verdict> {
     if let Seen::Bash(Err(e)) = &ctx.seen {
       return Some(Verdict {
         rule: RuleName::from("parse-error"),
         pattern: None,
+        bindings: Bindings::new(),
         decision: Decision::Ask {
           reason: format!("claude-guard could not parse this command: {e}"),
         },
       });
     }
 
+    let env = Env {
+      cwd: ctx.input.cwd.as_ref(),
+      fs,
+    };
     for rule in &self.rules {
-      if rule.when == When::InJjRepo && !ctx.in_jj_repo {
+      if let Some(when) = &rule.when
+        && when.eval(&env, &Bindings::new()) != Truth::True
+      {
         continue;
       }
-      for (matcher, guidance) in &rule.subjects {
-        if let Some(what) = matcher.find(&ctx.seen) {
+      for row in &rule.rows {
+        if let Some((what, bindings)) = find(row, &ctx.seen, &env) {
           return Some(Verdict {
-            rule: RuleName::from(rule.name),
-            pattern: Some(matcher.text()),
-            decision: render(rule.decision, &what, guidance),
+            rule: rule.name.clone(),
+            pattern: Some(PatternText::from(row.subject.to_string())),
+            decision: render(row, &what),
+            bindings,
           });
         }
       }
@@ -381,6 +180,7 @@ impl Ruleset {
       return Some(Verdict {
         rule: RuleName::from("uninspected"),
         pattern: None,
+        bindings: Bindings::new(),
         decision: Decision::Warn {
           context: format!("claude-guard did not inspect: {list}"),
         },
@@ -391,49 +191,65 @@ impl Ruleset {
   }
 }
 
-impl Matcher {
-  /// The subject as written in the table, for the log.
-  fn text(&self) -> PatternText {
-    match self {
-      Matcher::Command(pattern) => PatternText::from(pattern.to_string()),
-      Matcher::FileUnder(prefix) => PatternText::from(format!("{}/**", prefix.display())),
-    }
-  }
-
-  /// The text of what matched, for the reason line.
-  fn find(
-    &self,
-    seen: &Seen,
-  ) -> Option<String> {
-    match (self, seen) {
-      (Matcher::Command(pattern), Seen::Bash(Ok(segments))) => segments
-        .commands
-        .iter()
-        .find(|command| pattern.matches(command))
-        .map(describe),
-      (Matcher::FileUnder(prefix), Seen::File(path)) => pattern::normalize_path(path)
-        .starts_with(prefix)
-        .then(|| path.display().to_string()),
-      _ => None,
+impl From<Loaded> for Ruleset {
+  fn from(loaded: Loaded) -> Ruleset {
+    Ruleset {
+      source: loaded.source,
+      rules: loaded.file.rules,
     }
   }
 }
 
+/// The text of what matched and the bindings that satisfied the row's
+/// condition, or `None`.
+fn find(
+  row: &Row,
+  seen: &Seen,
+  env: &Env<'_>,
+) -> Option<(String, Bindings)> {
+  match (&row.subject, seen) {
+    (Subject::Command(pattern), Seen::Bash(Ok(segments))) => {
+      segments.commands.iter().find_map(|command| {
+        let chosen = cond::choose(row.when.as_ref(), pattern.bindings(command), env)?;
+        Some((describe(command), chosen))
+      })
+    }
+    (Subject::Tool(wanted), Seen::File { tool, path }) if wanted.tool == *tool => {
+      let text = path.to_string_lossy().into_owned();
+      let candidate = match &wanted.path {
+        PathArg::Literal(literal) => {
+          if pattern::normalize_path(Path::new(literal)) != pattern::normalize_path(path) {
+            return None;
+          }
+          Bindings::new()
+        }
+        PathArg::Var(var) => Bindings::from([(var.clone(), text.clone())]),
+      };
+      let chosen = cond::choose(row.when.as_ref(), vec![candidate], env)?;
+      Some((text, chosen))
+    }
+    _ => None,
+  }
+}
+
 fn render(
-  kind: Kind,
+  row: &Row,
   what: &str,
-  guidance: &Guidance,
 ) -> Decision {
-  let Guidance { reason, instead } = guidance;
-  match kind {
+  let reason = &row.reason;
+  let instead = match &row.instead {
+    Some(instead) => format!(" Instead: {instead}"),
+    None => String::new(),
+  };
+  match row.decision {
     Kind::Deny => Decision::Deny {
-      reason: format!("claude-guard denied `{what}`: {reason} Instead: {instead}"),
+      reason: format!("claude-guard denied `{what}`: {reason}{instead}"),
     },
     Kind::Ask => Decision::Ask {
-      reason: format!("claude-guard asks about `{what}`: {reason} Instead: {instead}"),
+      reason: format!("claude-guard asks about `{what}`: {reason}{instead}"),
     },
     Kind::Warn => Decision::Warn {
-      context: format!("claude-guard noted `{what}`: {reason} Instead: {instead}"),
+      context: format!("claude-guard noted `{what}`: {reason}{instead}"),
     },
   }
 }
@@ -462,8 +278,33 @@ fn describe(command: &SimpleCommand) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod testing {
   use super::*;
+
+  /// A filesystem that answers `ancestor-has?` from a fixed list.
+  pub struct FakeFs(pub Vec<&'static str>);
+
+  impl Fs for FakeFs {
+    fn ancestor_has(
+      &self,
+      _cwd: &Path,
+      name: &str,
+    ) -> Truth {
+      self.0.contains(&name).into()
+    }
+  }
+
+  /// A filesystem with a `.jj` above cwd, or without one.
+  pub fn repo(jj: bool) -> FakeFs {
+    FakeFs(if jj { vec![".jj"] } else { vec![] })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::testing::repo;
+  use super::*;
+  use crate::pattern::Var;
 
   fn input(tool: Tool) -> HookInput {
     HookInput {
@@ -481,15 +322,11 @@ mod tests {
     }
   }
 
-  fn ruleset() -> Ruleset {
-    Ruleset::builtin().expect("built-in rules compile")
-  }
-
   fn run(
     tool: Tool,
     in_jj_repo: bool,
   ) -> Option<Verdict> {
-    ruleset().evaluate(&Context::with_repo(input(tool), in_jj_repo))
+    Ruleset::builtin().evaluate(&Context::new(input(tool)), &repo(in_jj_repo))
   }
 
   fn deny_reason(verdict: Option<Verdict>) -> String {
@@ -507,11 +344,19 @@ mod tests {
   }
 
   #[test]
-  fn a_verdict_names_the_row_that_fired() {
+  fn a_verdict_names_the_row_that_fired_and_its_bindings() {
     let verdict = run(bash("git stash"), false).unwrap();
     assert_eq!(
       verdict.pattern,
-      Some(PatternText::from("git -... stash ..."))
+      Some(PatternText::from("[git -... stash ...]"))
+    );
+    assert!(verdict.bindings.is_empty());
+
+    let verdict = run(bash("cp -r dist /tmp/dist"), false).unwrap();
+    assert_eq!(verdict.pattern, Some(PatternText::from("[cp ... ?dst]")));
+    assert_eq!(
+      verdict.bindings,
+      Bindings::from([(Var::from("dst"), "/tmp/dist".to_string())])
     );
 
     let verdict = run(
@@ -521,48 +366,50 @@ mod tests {
       false,
     )
     .unwrap();
-    assert_eq!(verdict.pattern, Some(PatternText::from("/tmp/**")));
+    assert_eq!(verdict.pattern, Some(PatternText::from("(write ?path)")));
+    assert_eq!(
+      verdict.bindings,
+      Bindings::from([(Var::from("path"), "/tmp/x".to_string())])
+    );
 
     let verdict = run(bash("git stash &&"), false).unwrap();
     assert_eq!(verdict.pattern, None);
   }
 
-  // --- the table itself ---
+  // --- the shipped file ---
 
   #[test]
-  fn the_builtin_table_compiles() {
-    let rules = ruleset();
-    assert_eq!(rules.rules.len(), RULES.len());
+  fn the_builtin_file_loads_with_its_four_rules() {
+    let rules = Ruleset::builtin();
+    assert_eq!(rules.source, Source::Builtin);
+    let names: Vec<_> = rules.rules().iter().map(|r| r.name.to_string()).collect();
+    assert_eq!(
+      names,
+      ["hard-denies", "git-in-jj", "tmp-writes", "tool-nudges"]
+    );
   }
 
   #[test]
-  fn warn_rules_come_after_every_deny_and_ask() {
-    let last_stop = RULES
+  fn warn_rows_come_after_every_deny_and_ask() {
+    let rows: Vec<Kind> = Ruleset::builtin()
+      .rules()
       .iter()
-      .rposition(|r| r.decision != Kind::Warn)
-      .unwrap_or(0);
-    let first_warn = RULES.iter().position(|r| r.decision == Kind::Warn);
-    if let Some(first_warn) = first_warn {
-      assert!(first_warn > last_stop, "a warn rule precedes a deny rule");
+      .flat_map(|r| r.rows.iter().map(|row| row.decision))
+      .collect();
+    let last_stop = rows.iter().rposition(|k| *k != Kind::Warn).unwrap_or(0);
+    if let Some(first_warn) = rows.iter().position(|k| *k == Kind::Warn) {
+      assert!(first_warn > last_stop, "a warn row precedes a deny row");
     }
   }
 
   #[test]
   fn every_guidance_ends_with_a_period() {
-    for rule in RULES {
-      for (_, guidance) in rule.subjects {
-        assert!(
-          guidance.reason.ends_with('.'),
-          "{}: {:?}",
-          rule.name,
-          guidance.reason
-        );
-        assert!(
-          guidance.instead.ends_with('.'),
-          "{}: {:?}",
-          rule.name,
-          guidance.instead
-        );
+    for rule in Ruleset::builtin().rules() {
+      for row in &rule.rows {
+        assert!(row.reason.ends_with('.'), "{}: {:?}", rule.name, row.reason);
+        if let Some(instead) = &row.instead {
+          assert!(instead.ends_with('.'), "{}: {instead:?}", rule.name);
+        }
       }
     }
   }
@@ -697,6 +544,15 @@ mod tests {
     assert_eq!(run(bash("cat < /tmp/x"), false), None);
     assert_eq!(run(bash("cp a /var/tmp/b"), false), None);
     assert_eq!(run(bash("echo hi > out.txt"), false), None);
+    assert_eq!(run(bash("cp a $TMPDIR/x"), false), None);
+  }
+
+  #[test]
+  fn a_relative_target_counts_when_cwd_is_under_tmp() {
+    let mut input = input(bash("echo hi > out.txt"));
+    input.cwd = "/tmp/work".into();
+    let verdict = Ruleset::builtin().evaluate(&Context::new(input), &repo(false));
+    assert_eq!(rule_name(verdict), "tmp-writes");
   }
 
   #[test]
@@ -803,6 +659,77 @@ mod tests {
       None
     );
     assert_eq!(run(bash("cargo nextest run"), true), None);
+  }
+
+  // --- rows from a file of one's own ---
+
+  fn run_with(
+    text: &str,
+    tool: Tool,
+  ) -> Option<Verdict> {
+    Ruleset::from_text(text)
+      .unwrap_or_else(|e| panic!("{e}"))
+      .evaluate(&Context::new(input(tool)), &repo(false))
+  }
+
+  #[test]
+  fn ask_and_warn_rows_render_their_own_prefix() {
+    let text = "(rule r (ask [jj -... abandon ...] :reason \"look first.\" :instead \"run `jj status`.\") (warn [cargo -... clean ...] :reason \"slow.\"))";
+    assert_eq!(
+      run_with(text, bash("jj abandon")).unwrap().decision,
+      Decision::Ask {
+        reason: "claude-guard asks about `jj abandon`: look first. Instead: run `jj status`."
+          .into()
+      }
+    );
+    assert_eq!(
+      run_with(text, bash("cargo clean")).unwrap().decision,
+      Decision::Warn {
+        context: "claude-guard noted `cargo clean`: slow.".into()
+      }
+    );
+  }
+
+  #[test]
+  fn a_literal_tool_path_matches_by_normalized_path() {
+    let text = "(rule r (deny (read \"/tmp/secret\") :reason \"no.\" :instead \"ask.\"))";
+    assert!(
+      run_with(
+        text,
+        Tool::Read {
+          path: "/private/tmp/secret".into()
+        }
+      )
+      .is_some()
+    );
+    assert!(
+      run_with(
+        text,
+        Tool::Read {
+          path: "/tmp/other".into()
+        }
+      )
+      .is_none()
+    );
+    assert!(
+      run_with(
+        text,
+        Tool::Write {
+          path: "/tmp/secret".into()
+        }
+      )
+      .is_none()
+    );
+  }
+
+  #[test]
+  fn a_row_fires_on_the_first_binding_set_that_holds() {
+    let text = "(rule r (deny [cp ... ?x ...] :when (under? ?x \"/tmp\") :reason \"no.\" :instead \"ask.\"))";
+    let verdict = run_with(text, bash("cp a /tmp/b /tmp/c")).unwrap();
+    assert_eq!(
+      verdict.bindings,
+      Bindings::from([(Var::from("x"), "/tmp/b".to_string())])
+    );
   }
 
   #[test]

@@ -20,9 +20,6 @@
 //! writes a node back so that reading the output gives the same tree,
 //! which is what `rules --export` relies on.
 
-// Used by the rule loader, which lands in claude-guard-110.2.
-#![allow(dead_code)]
-
 use std::fmt;
 
 /// Where a node starts in its source text. One-based, columns in chars.
@@ -94,6 +91,7 @@ pub fn read_all(source: &str) -> Result<Vec<Node>, ReadError> {
 }
 
 /// Read exactly one form. Anything after it is an error.
+#[cfg(test)]
 pub fn read_one(source: &str) -> Result<Node, ReadError> {
   let mut reader = Reader::new(source);
   let Some(node) = reader.next_node(None)? else {
@@ -324,7 +322,10 @@ fn opener(close: Close) -> char {
 
 // --- printing ---
 
-/// Width the pretty printer tries to stay within.
+/// Width the pretty printer tries to stay within. The pretty printer has
+/// no caller yet: `rules --export` prints the built-in file verbatim so
+/// its comments survive. A formatter for user files will use it.
+#[allow(dead_code)]
 const WIDTH: usize = 80;
 
 impl Node {
@@ -355,6 +356,7 @@ impl Node {
   /// [`WIDTH`] prints flat. One that does not keeps its head on the first
   /// line and puts every other item on its own line, two columns in.
   /// Patterns always print flat: they are one shell line.
+  #[allow(dead_code)]
   pub fn pretty(&self) -> String {
     let mut out = String::new();
     self.write_pretty(&mut out, 0);
@@ -387,6 +389,7 @@ impl Node {
 }
 
 /// Print top-level forms, one per paragraph.
+#[allow(dead_code)]
 pub fn pretty_all(forms: &[Node]) -> String {
   let mut out = String::new();
   for (i, form) in forms.iter().enumerate() {
