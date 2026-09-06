@@ -8,6 +8,7 @@
 
 mod cond;
 mod input;
+mod load;
 mod log;
 mod output;
 mod pattern;
