@@ -60,18 +60,43 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo build
+cargo nextest run              # unit, integration, and the executable spec under spec/
+cargo clippy --all-targets     # must be clean
+cargo fmt                      # rustfmt config: 2 spaces, vertical fn params
+cargo install --path .         # a dev build into ~/.cargo/bin; users get `cargo install claude-guard`
 ```
+
+Tests never touch the real state or config directories: set `CLAUDE_GUARD_STATE_DIR`, `CLAUDE_GUARD_RULES`, and `CLAUDE_GUARD_COMMANDS_DIR` to temp dirs, as `tests/cli.rs` does. `spec/*.scm` holds `check` forms run by `spec::tests::the_spec_passes`; every matcher, condition, and elaborator behavior has a line there. `tests/fixtures/commands.jsonl` is a corpus of real logged commands for the elaborator's round-trip test.
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+One binary, flat modules, no `mod.rs`. A hook call flows top to bottom:
+
+- `main.rs`: subcommand dispatch, the fail-open wrapper (exit 0 always, one stderr line on failure), tracing setup.
+- `input.rs`: the hook payload as typed structs; the `string_id!` newtypes (`SessionId`, `ToolUseId`, `RuleName`, ...); tool inputs as a `Tool` enum.
+- `segment.rs`: a Bash command to simple commands via brush-parser: words after quote removal, literal or dynamic, plus file redirects; `$(...)` text is reported as uninspected.
+- `elaborate.rs`: a simple command classified under a declaration: name, options with values, args, subcommand path, inner command or script. A partition of the words; `flatten` returns the input.
+- `sexp.rs`, `syntax.rs`, `cond.rs`, `load.rs`: the rule language. Reader with positions; forms to a typed table (`rule`, rows, patterns, `command` declarations); conditions with three-valued evaluation; which files load and how declarations merge.
+- `pattern.rs`: the matcher over elaborated units. Tokens keep their meaning; a declaration changes what they see.
+- `rules.rs`: the engine. Parse error asks; rules in order, first row wins, through inner commands to depth 8; uninspected substitutions warn.
+- `output.rs`: the Claude Code wire format for deny, ask, and warn.
+- `log.rs`: one typed JSONL record per hook call, schema v1, written before stdout, never changing the decision.
+- `commands.rs`: the `commands` survey over the logs and `commands add` from carapace.
+- `spec.rs`: the `check` runner.
+
+Conditions are three-valued: true, false, unknown, combined by Kleene's tables (false AND unknown is false, true OR unknown is true, NOT leaves unknown alone, everything else with an unknown stays unknown). Nothing produces unknown yet; the seam is for extern predicates and cwd tracking, and the design turns unknown on a matched pattern into an ask. `docs/explanation/why-a-policy-language.md` has the tables and the reasons.
+
+Design decisions and their reasons are in `docs/design/*/01-decisions.md`, in the user's words, with the principles distilled next to them. Read those before changing the engine or the language.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Plan, then implement. Each step is proposed with numbered decisions and a recommendation, reviewed, then built in full with tests. Nothing is left as a stub for the user to fill in.
+- A decision made while implementing is written into the decision log the same day, with its reasons.
+- Every behavior of the matcher, conditions, and elaborator gets a `check` line in `spec/` as well as a Rust test. A behavior without a check line does not exist.
+- Newtypes over strings via `string_id!`; no bare `String` for an id or a name that crosses a module boundary.
+- Errors carry positions. Anything read from a file reports `source:line:col: message`, and one load reports every problem.
+- The guard fails open. Any failure is one stderr line and exit 0; the decision log is written before stdout and never changes the decision.
+- Reasons in rule files name the danger, not the workflow: "git checkout overwrites working files", with the alternative in `:instead`.
+- Conventional Commits, `jj` not `git`, no attribution trailers in commits.

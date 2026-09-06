@@ -5,3 +5,6 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Beads interaction log: who did what, when. Local only.
+.beads/interactions.jsonl
