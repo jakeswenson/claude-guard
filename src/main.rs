@@ -16,6 +16,7 @@ mod repo;
 mod rules;
 mod segment;
 mod sexp;
+mod spec;
 mod syntax;
 
 use std::io::{IsTerminal, Read};

@@ -298,7 +298,9 @@ fn string(
   }
 }
 
-fn parse_subject(node: &Node) -> Result<Subject, TypeError> {
+/// Check one node as a row subject: a `[pattern]` or a tool pattern.
+/// Public so the spec runner can check a bare subject.
+pub fn parse_subject(node: &Node) -> Result<Subject, TypeError> {
   match &node.kind {
     Sx::Pattern(words) => Ok(Subject::Command(parse_pattern(node, words)?)),
     Sx::List(items) => Ok(Subject::Tool(parse_tool(node, items)?)),
