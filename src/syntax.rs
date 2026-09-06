@@ -3,13 +3,17 @@
 //! The grammar this module accepts:
 //!
 //! ```text
-//! file    := rule*
+//! file    := (rule | command)*
 //! rule    := (rule <name> [:when <cond>] row+)
 //! row     := (deny|ask|warn <subject> [:when <cond>] :reason "..." [:instead "..."])
 //! subject := [word*]                       ; a Bash command pattern
 //!          | (write|edit|multi-edit|read <path>)   ; a file tool pattern
 //! word    := <symbol> | "..." | > <word> | >> <word> | < <word>
 //! path    := "..." | ?name
+//! command := (command <name> decl)
+//! decl    := (option "-c" ["--long"] [:value | :optional])*
+//!            (subcommand <name> [:alias <name>]* decl)*
+//!            [:inner (command [:from N]) | (script [:from N] [:when "-c"]) | (script :option "-c")]
 //! ```
 //!
 //! Pattern words map to the tokens in [`pattern`]: `*`, `...`, `-*`,
@@ -28,15 +32,26 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::cond::{self, Cond, Scope};
+use crate::elaborate::{Arity, Declaration, InnerSpec, OptionSpec};
 use crate::pattern::{Pattern, RedirectPattern, Token, Var};
 use crate::rules::{Kind, RuleName};
 use crate::segment::RedirectKind;
 use crate::sexp::{Kind as Sx, Node, Span};
 
-/// A whole rule file, in evaluation order.
+/// A whole rule file: rules in evaluation order, and the command
+/// declarations it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
   pub rules: Vec<Rule>,
+  pub commands: Vec<CommandDecl>,
+}
+
+/// One `(command name ...)` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandDecl {
+  pub span: Span,
+  pub name: String,
+  pub declaration: Declaration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,35 +172,63 @@ fn err<T>(
   })
 }
 
+const EXPECTED_FORM: &str = "expected (rule ...) or (command ...)";
+
 /// Check every top-level form. All the errors, or the table.
 pub fn parse(forms: &[Node]) -> Result<File, Vec<TypeError>> {
-  let mut rules = Vec::new();
+  let mut file = File {
+    rules: Vec::new(),
+    commands: Vec::new(),
+  };
   let mut errors = Vec::new();
   for form in forms {
-    match parse_rule(form) {
-      Ok(rule) => rules.push(rule),
-      Err(e) => errors.push(e),
+    let result = match head_symbol(form) {
+      Some("rule") => parse_rule(form).map(|rule| file.rules.push(rule)),
+      Some("command") => parse_command(form).map(|decl| file.commands.push(decl)),
+      Some(other) => err(
+        form_head(form).span,
+        format!("{EXPECTED_FORM}, found `{other}`"),
+      ),
+      None => err(form_head(form).span, EXPECTED_FORM),
+    };
+    if let Err(e) = result {
+      errors.push(e);
     }
   }
   if errors.is_empty() {
-    Ok(File { rules })
+    Ok(file)
   } else {
     Err(errors)
   }
 }
 
+/// The head symbol of a list form, if it has one.
+fn head_symbol(form: &Node) -> Option<&str> {
+  match &form.kind {
+    Sx::List(items) => match items.first().map(|n| &n.kind) {
+      Some(Sx::Symbol(s)) => Some(s.as_str()),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+/// The node an error about a form's head points at: the head when there
+/// is one, else the form.
+fn form_head(form: &Node) -> &Node {
+  match &form.kind {
+    Sx::List(items) => items.first().unwrap_or(form),
+    _ => form,
+  }
+}
+
 fn parse_rule(form: &Node) -> Result<Rule, TypeError> {
   let Sx::List(items) = &form.kind else {
-    return err(form.span, "expected (rule ...)");
+    return err(form.span, EXPECTED_FORM);
   };
-  let Some((head, items)) = items.split_first() else {
-    return err(form.span, "expected (rule ...)");
+  let Some((_head, items)) = items.split_first() else {
+    return err(form.span, EXPECTED_FORM);
   };
-  match &head.kind {
-    Sx::Symbol(s) if s == "rule" => {}
-    Sx::Symbol(other) => return err(head.span, format!("expected (rule ...), found `{other}`")),
-    _ => return err(head.span, "expected (rule ...)"),
-  }
   let Some((name_node, items)) = items.split_first() else {
     return err(form.span, "rule needs a name");
   };
@@ -302,6 +345,259 @@ fn parse_row(node: &Node) -> Result<Row, TypeError> {
     reason,
     instead,
   })
+}
+
+// --- command declarations ---
+
+/// `(command name (option ...)* (subcommand ...)* [:inner ...])`.
+fn parse_command(form: &Node) -> Result<CommandDecl, TypeError> {
+  let Sx::List(items) = &form.kind else {
+    return err(form.span, EXPECTED_FORM);
+  };
+  let [_head, name_node, body @ ..] = items.as_slice() else {
+    return err(form.span, "command needs a name");
+  };
+  let Sx::Symbol(name) = &name_node.kind else {
+    return err(name_node.span, "command name must be a symbol");
+  };
+  let (declaration, aliases) = parse_declaration(form, body, false)?;
+  debug_assert!(aliases.is_empty());
+  Ok(CommandDecl {
+    span: form.span,
+    name: name.clone(),
+    declaration,
+  })
+}
+
+/// The body shared by `(command ...)` and `(subcommand ...)`: options,
+/// subcommands, `:inner`, and, for a subcommand, `:alias`. Returns the
+/// declaration and the aliases.
+fn parse_declaration(
+  form: &Node,
+  body: &[Node],
+  is_subcommand: bool,
+) -> Result<(Declaration, Vec<String>), TypeError> {
+  let mut declaration = Declaration::default();
+  let mut aliases = Vec::new();
+  let mut i = 0;
+  while i < body.len() {
+    let item = &body[i];
+    match &item.kind {
+      Sx::List(_) => match head_symbol(item) {
+        Some("option") => {
+          let spec = parse_option(item)?;
+          for earlier in &declaration.options {
+            if let (Some(a), Some(b)) = (earlier.short, spec.short)
+              && a == b
+            {
+              return err(item.span, format!("option `-{a}` declared twice"));
+            }
+            if let (Some(a), Some(b)) = (&earlier.long, &spec.long)
+              && a == b
+            {
+              return err(item.span, format!("option `--{a}` declared twice"));
+            }
+          }
+          declaration.options.push(spec);
+        }
+        Some("subcommand") => {
+          let (sub_name, sub, sub_aliases) = parse_subcommand(item)?;
+          for name in std::iter::once(&sub_name).chain(&sub_aliases) {
+            if declaration
+              .subcommands
+              .insert(name.clone(), sub.clone())
+              .is_some()
+            {
+              return err(item.span, format!("subcommand `{name}` declared twice"));
+            }
+          }
+        }
+        _ => return err(item.span, "expected (option ...) or (subcommand ...)"),
+      },
+      Sx::Keyword(key) => {
+        let Some(value) = body.get(i + 1) else {
+          return err(item.span, format!("`:{key}` needs a value"));
+        };
+        match key.as_str() {
+          "inner" => {
+            if declaration.inner.is_some() {
+              return err(item.span, "`:inner` given twice");
+            }
+            declaration.inner = Some(parse_inner(value, &declaration)?);
+          }
+          "alias" if is_subcommand => {
+            let Sx::Symbol(alias) = &value.kind else {
+              return err(value.span, "`:alias` takes a symbol");
+            };
+            aliases.push(alias.clone());
+          }
+          other => return err(item.span, format!("unknown keyword `:{other}` in command")),
+        }
+        i += 2;
+        continue;
+      }
+      _ => {
+        return err(
+          item.span,
+          "expected (option ...), (subcommand ...), or :inner",
+        );
+      }
+    }
+    i += 1;
+  }
+  let _ = form;
+  Ok((declaration, aliases))
+}
+
+/// `(option "-C" "--git-dir" [:value | :optional])`.
+fn parse_option(node: &Node) -> Result<OptionSpec, TypeError> {
+  let Sx::List(items) = &node.kind else {
+    unreachable!("caller checked");
+  };
+  let mut spec = OptionSpec {
+    short: None,
+    long: None,
+    arity: Arity::None,
+  };
+  let mut named = false;
+  for item in &items[1..] {
+    match &item.kind {
+      Sx::Str(text) => {
+        named = true;
+        let mut chars = text.strip_prefix('-').unwrap_or("").chars();
+        match (chars.next(), text.strip_prefix("--")) {
+          (Some('-'), Some(long)) if !long.is_empty() && !long.starts_with('-') => {
+            if spec.long.replace(long.to_string()).is_some() {
+              return err(item.span, "an option has one long form");
+            }
+          }
+          (Some(short), None) if chars.next().is_none() && short != '-' => {
+            if spec.short.replace(short).is_some() {
+              return err(item.span, "an option has one short form");
+            }
+          }
+          _ => {
+            return err(
+              item.span,
+              format!("option names look like \"-c\" or \"--long\", not {text:?}"),
+            );
+          }
+        }
+      }
+      Sx::Keyword(key) if key == "value" => spec.arity = Arity::One,
+      Sx::Keyword(key) if key == "optional" => spec.arity = Arity::Optional,
+      Sx::Keyword(key) => return err(item.span, format!("unknown keyword `:{key}` in option")),
+      _ => {
+        return err(
+          item.span,
+          "expected an option name string, :value, or :optional",
+        );
+      }
+    }
+  }
+  if !named {
+    return err(node.span, "option needs a name");
+  }
+  Ok(spec)
+}
+
+/// `(subcommand name [:alias other]* (option ...)* (subcommand ...)* [:inner ...])`.
+fn parse_subcommand(node: &Node) -> Result<(String, Declaration, Vec<String>), TypeError> {
+  let Sx::List(items) = &node.kind else {
+    unreachable!("caller checked");
+  };
+  let [_head, name_node, body @ ..] = items.as_slice() else {
+    return err(node.span, "subcommand needs a name");
+  };
+  let Sx::Symbol(name) = &name_node.kind else {
+    return err(name_node.span, "subcommand name must be a symbol");
+  };
+  let (declaration, aliases) = parse_declaration(node, body, true)?;
+  Ok((name.clone(), declaration, aliases))
+}
+
+/// `(command [:from N])`, `(script :from N [:when "-c"])`, or
+/// `(script :option "-c")`. A flag named here must be declared above it.
+fn parse_inner(
+  node: &Node,
+  declaration: &Declaration,
+) -> Result<InnerSpec, TypeError> {
+  let Sx::List(items) = &node.kind else {
+    return err(node.span, "`:inner` takes (command ...) or (script ...)");
+  };
+  let Some((head, args)) = items.split_first() else {
+    return err(node.span, "`:inner` takes (command ...) or (script ...)");
+  };
+  let Sx::Symbol(kind) = &head.kind else {
+    return err(head.span, "`:inner` takes (command ...) or (script ...)");
+  };
+  let mut from = None;
+  let mut when = None;
+  let mut option = None;
+  let mut i = 0;
+  while i < args.len() {
+    let Sx::Keyword(key) = &args[i].kind else {
+      return err(args[i].span, "expected :from, :when, or :option");
+    };
+    let Some(value) = args.get(i + 1) else {
+      return err(args[i].span, format!("`:{key}` needs a value"));
+    };
+    match (kind.as_str(), key.as_str()) {
+      (_, "from") => {
+        let parsed = match &value.kind {
+          Sx::Symbol(digits) => digits.parse::<usize>().ok(),
+          _ => None,
+        };
+        let Some(n) = parsed else {
+          return err(value.span, "`:from` takes a number");
+        };
+        from = Some(n);
+      }
+      ("script", "when") => when = Some(declared_flag(value, declaration)?),
+      ("script", "option") => option = Some(declared_flag(value, declaration)?),
+      (_, other) => {
+        return err(
+          args[i].span,
+          format!("unknown keyword `:{other}` in `{kind}`"),
+        );
+      }
+    }
+    i += 2;
+  }
+  match (kind.as_str(), from, when, option) {
+    ("command", from, None, None) => Ok(InnerSpec::Command {
+      from: from.unwrap_or(0),
+    }),
+    ("script", None, None, Some(flag)) => Ok(InnerSpec::ScriptOption { flag }),
+    ("script", Some(_), _, Some(_)) => err(node.span, "`:option` and `:from` do not combine"),
+    ("script", from, when_flag, None) => Ok(InnerSpec::Script {
+      from: from.unwrap_or(0),
+      when_flag,
+    }),
+    _ => err(head.span, "`:inner` takes (command ...) or (script ...)"),
+  }
+}
+
+/// A flag string naming an option declared on `declaration`, returned
+/// without its dashes as the elaborator names flags.
+fn declared_flag(
+  node: &Node,
+  declaration: &Declaration,
+) -> Result<String, TypeError> {
+  let Sx::Str(text) = &node.kind else {
+    return err(node.span, "expected an option name string");
+  };
+  let name = text.trim_start_matches('-');
+  let declared = declaration.options.iter().any(|o| {
+    o.long.as_deref() == Some(name) || (name.chars().count() == 1 && o.short == name.chars().next())
+  });
+  if !declared || name.is_empty() {
+    return err(
+      node.span,
+      format!("{text:?} names an option this command does not declare"),
+    );
+  }
+  Ok(name.to_string())
 }
 
 fn set_once<T>(
@@ -638,7 +934,9 @@ mod tests {
 
   #[test]
   fn an_empty_file_is_an_empty_table() {
-    assert_eq!(file("; nothing").rules, vec![]);
+    let empty = file("; nothing");
+    assert_eq!(empty.rules, vec![]);
+    assert_eq!(empty.commands, vec![]);
   }
 
   // --- pattern words ---
@@ -705,14 +1003,196 @@ mod tests {
   // --- errors: file and rule shape ---
 
   #[test]
-  fn a_top_level_form_must_be_a_rule() {
-    assert_eq!(error("[git stash]"), "1:1: expected (rule ...)");
-    assert_eq!(error("()"), "1:1: expected (rule ...)");
+  fn a_top_level_form_must_be_a_rule_or_a_command() {
+    let expected = "expected (rule ...) or (command ...)";
+    assert_eq!(error("[git stash]"), format!("1:1: {expected}"));
+    assert_eq!(error("()"), format!("1:1: {expected}"));
     assert_eq!(
       error("(rulez x)"),
-      "1:2: expected (rule ...), found `rulez`"
+      format!("1:2: {expected}, found `rulez`")
     );
-    assert_eq!(error("(\"rule\" x)"), "1:2: expected (rule ...)");
+    assert_eq!(error("(\"rule\" x)"), format!("1:2: {expected}"));
+  }
+
+  // --- command declarations ---
+
+  fn command(source: &str) -> CommandDecl {
+    let mut file = file(source);
+    assert_eq!(file.commands.len(), 1);
+    file.commands.remove(0)
+  }
+
+  fn opt(
+    short: Option<char>,
+    long: Option<&str>,
+    arity: Arity,
+  ) -> OptionSpec {
+    OptionSpec {
+      short,
+      long: long.map(str::to_string),
+      arity,
+    }
+  }
+
+  #[test]
+  fn a_command_declares_options_with_their_arity() {
+    let decl = command(
+      "(command git (option \"-C\" :value) (option \"-P\" \"--no-pager\") (option \"--color\" :optional))",
+    );
+    assert_eq!(decl.name, "git");
+    assert_eq!(decl.span, Span { line: 1, col: 1 });
+    assert_eq!(
+      decl.declaration.options,
+      vec![
+        opt(Some('C'), None, Arity::One),
+        opt(Some('P'), Some("no-pager"), Arity::None),
+        opt(None, Some("color"), Arity::Optional),
+      ]
+    );
+    assert_eq!(decl.declaration.inner, None);
+    assert!(decl.declaration.subcommands.is_empty());
+  }
+
+  #[test]
+  fn subcommands_nest_and_aliases_share_the_declaration() {
+    let decl = command(
+      "(command git (option \"-C\" :value) (subcommand stash :alias save (option \"-q\") (subcommand pop)))",
+    );
+    let stash = &decl.declaration.subcommands["stash"];
+    assert_eq!(stash.options, vec![opt(Some('q'), None, Arity::None)]);
+    assert!(stash.subcommands.contains_key("pop"));
+    assert_eq!(decl.declaration.subcommands["save"], *stash);
+  }
+
+  #[test]
+  fn inner_forms_map_to_their_specs() {
+    let inner = |source: &str| command(source).declaration.inner;
+    assert_eq!(
+      inner("(command sudo :inner (command))"),
+      Some(InnerSpec::Command { from: 0 })
+    );
+    assert_eq!(
+      inner("(command timeout :inner (command :from 1))"),
+      Some(InnerSpec::Command { from: 1 })
+    );
+    assert_eq!(
+      inner("(command ssh :inner (script :from 1))"),
+      Some(InnerSpec::Script {
+        from: 1,
+        when_flag: None
+      })
+    );
+    assert_eq!(
+      inner("(command bash (option \"-c\") :inner (script :from 0 :when \"-c\"))"),
+      Some(InnerSpec::Script {
+        from: 0,
+        when_flag: Some("c".into())
+      })
+    );
+    assert_eq!(
+      inner(
+        "(command nu (option \"-c\" \"--commands\" :value) :inner (script :option \"--commands\"))"
+      ),
+      Some(InnerSpec::ScriptOption {
+        flag: "commands".into()
+      })
+    );
+  }
+
+  #[test]
+  fn the_builtin_commands_file_type_checks() {
+    let file = file(crate::load::BUILTIN_COMMANDS);
+    let names: Vec<_> = file.commands.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+      names,
+      [
+        "sudo", "env", "nice", "nohup", "timeout", "xargs", "ssh", "bash", "sh", "nu", "python3"
+      ]
+    );
+    assert!(file.commands.iter().all(|c| c.declaration.inner.is_some()));
+    assert!(file.rules.is_empty());
+  }
+
+  #[test]
+  fn command_declarations_are_checked() {
+    assert_eq!(error("(command)"), "1:1: command needs a name");
+    assert_eq!(
+      error("(command \"git\")"),
+      "1:10: command name must be a symbol"
+    );
+    assert_eq!(
+      error("(command git banana)"),
+      "1:14: expected (option ...), (subcommand ...), or :inner"
+    );
+    assert_eq!(
+      error("(command git (flag \"-x\"))"),
+      "1:14: expected (option ...) or (subcommand ...)"
+    );
+    assert_eq!(
+      error("(command git :alias g)"),
+      "1:14: unknown keyword `:alias` in command"
+    );
+    assert_eq!(error("(command git (option))"), "1:14: option needs a name");
+    assert_eq!(
+      error("(command git (option \"C\"))"),
+      "1:22: option names look like \"-c\" or \"--long\", not \"C\""
+    );
+    assert_eq!(
+      error("(command git (option \"---x\"))"),
+      "1:22: option names look like \"-c\" or \"--long\", not \"---x\""
+    );
+    assert_eq!(
+      error("(command git (option \"-C\" \"-D\"))"),
+      "1:27: an option has one short form"
+    );
+    assert_eq!(
+      error("(command git (option \"-C\" :maybe))"),
+      "1:27: unknown keyword `:maybe` in option"
+    );
+    assert_eq!(
+      error("(command git (option \"-C\") (option \"-C\"))"),
+      "1:28: option `-C` declared twice"
+    );
+    assert_eq!(
+      error("(command git (option \"--x\") (option \"-y\" \"--x\"))"),
+      "1:29: option `--x` declared twice"
+    );
+    assert_eq!(
+      error("(command git (subcommand))"),
+      "1:14: subcommand needs a name"
+    );
+    assert_eq!(
+      error("(command git (subcommand a) (subcommand b :alias a))"),
+      "1:29: subcommand `a` declared twice"
+    );
+    assert_eq!(
+      error("(command git :inner)"),
+      "1:14: `:inner` needs a value"
+    );
+    assert_eq!(
+      error("(command git :inner (command) :inner (command))"),
+      "1:31: `:inner` given twice"
+    );
+    assert_eq!(
+      error("(command git :inner (spawn))"),
+      "1:22: `:inner` takes (command ...) or (script ...)"
+    );
+    assert_eq!(
+      error("(command git :inner (command :from x))"),
+      "1:36: `:from` takes a number"
+    );
+    assert_eq!(
+      error("(command git :inner (command :when \"-c\"))"),
+      "1:30: unknown keyword `:when` in `command`"
+    );
+    assert_eq!(
+      error("(command bash :inner (script :when \"-c\"))"),
+      "1:36: \"-c\" names an option this command does not declare"
+    );
+    assert_eq!(
+      error("(command nu (option \"-c\" :value) :inner (script :from 0 :option \"-c\"))"),
+      "1:41: `:option` and `:from` do not combine"
+    );
   }
 
   #[test]

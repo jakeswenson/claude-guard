@@ -110,10 +110,11 @@ fn rules_command(args: &[String]) -> Result<()> {
       Ok(rules) => {
         let rows: usize = rules.rules().iter().map(|r| r.rows.len()).sum();
         println!(
-          "{}: {} rules, {} rows",
+          "{}: {} rules, {} rows, {} commands declared",
           rules.source,
           rules.rules().len(),
-          rows
+          rows,
+          rules.declarations.by_name.len()
         );
         Ok(())
       }

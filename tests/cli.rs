@@ -236,7 +236,7 @@ fn rules_reports_the_source_in_force() {
     .arg("rules")
     .assert()
     .code(0)
-    .stdout("built-in rules: 4 rules, 29 rows\n");
+    .stdout("built-in rules: 4 rules, 29 rows, 11 commands declared\n");
 
   let state = state_dir();
   let rules = state.path().join("rules.scm");
@@ -346,6 +346,37 @@ fn hook_still_denies_when_the_log_cannot_be_written() {
     .code(0)
     .stdout(predicate::str::contains("\"permissionDecision\":\"deny\""))
     .stderr(predicate::str::contains("decision log write failed"));
+}
+
+#[test]
+fn user_command_declarations_are_counted_and_checked() {
+  let state = state_dir();
+  let commands = state.path().join("commands");
+  fs::create_dir_all(&commands).unwrap();
+  fs::write(
+    commands.join("jj.scm"),
+    "(command jj (option \"-R\" :value))",
+  )
+  .unwrap();
+  guard()
+    .env("XDG_CONFIG_HOME", state_dir().path())
+    .env("CLAUDE_GUARD_COMMANDS_DIR", &commands)
+    .arg("rules")
+    .assert()
+    .code(0)
+    .stdout("built-in rules: 4 rules, 29 rows, 12 commands declared\n");
+
+  fs::write(commands.join("bad.scm"), "(command git (option \"C\"))").unwrap();
+  guard()
+    .env("XDG_CONFIG_HOME", state_dir().path())
+    .env("CLAUDE_GUARD_COMMANDS_DIR", &commands)
+    .arg("rules")
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains(
+      "bad.scm:1:22: option names look like \"-c\" or \"--long\", not \"C\"",
+    ));
 }
 
 #[test]

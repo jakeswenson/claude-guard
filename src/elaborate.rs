@@ -65,15 +65,19 @@ pub enum Arity {
 /// Where a declared command carries another command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InnerSpec {
-  /// The arguments are a command: sudo, env, nice, nohup, timeout, xargs.
-  Command,
+  /// The arguments from `from` on are a command: sudo, env, nice, nohup,
+  /// xargs at 0; timeout at 1, after the duration.
+  Command { from: usize },
   /// The arguments from `from` on are a script, joined with spaces. For
   /// ssh `from` is 1, after the host. `when_flag` gates it: bash's script
-  /// is argument 0 only under `-c`.
+  /// is argument 0 only under `-c`. Flags are named without dashes.
   Script {
     from: usize,
     when_flag: Option<String>,
   },
+  /// The value of option `flag` is a script: `nu -c "..."`,
+  /// `python3 -c "..."`. Named without dashes.
+  ScriptOption { flag: String },
 }
 
 /// Every declaration the guard knows, by program name.
@@ -253,16 +257,24 @@ impl Declarations {
   ) -> Option<Inner> {
     let args: Vec<&Word> = out.args().skip(out.subcommand.len()).collect();
     match spec {
-      InnerSpec::Command => {
-        if args.is_empty() {
+      InnerSpec::Command { from } => {
+        let words: Vec<Word> = args.into_iter().skip(*from).cloned().collect();
+        if words.is_empty() {
           return None;
         }
         let command = SimpleCommand {
-          words: args.into_iter().cloned().collect(),
+          words,
           redirects: Vec::new(),
         };
         Some(Inner::Command(Box::new(self.elaborate(&command))))
       }
+      InnerSpec::ScriptOption { flag } => out
+        .options()
+        .find(|group| group.flags.iter().any(|f| f == flag))
+        .and_then(|group| group.value.as_ref())
+        .map(|value| match &value.text {
+          Word::Literal(text) | Word::Dynamic(text) => Inner::Script(text.clone()),
+        }),
       InnerSpec::Script { from, when_flag } => {
         if let Some(flag) = when_flag
           && !out.has_flag(flag)
@@ -550,7 +562,26 @@ pub mod testing {
         opt(Some('n'), Some("non-interactive"), Arity::None),
       ],
       subcommands: BTreeMap::new(),
-      inner: Some(InnerSpec::Command),
+      inner: Some(InnerSpec::Command { from: 0 }),
+    }
+  }
+
+  pub fn timeout() -> Declaration {
+    Declaration {
+      options: vec![opt(Some('k'), Some("kill-after"), Arity::One)],
+      subcommands: BTreeMap::new(),
+      inner: Some(InnerSpec::Command { from: 1 }),
+    }
+  }
+
+  pub fn nu() -> Declaration {
+    Declaration {
+      options: vec![
+        opt(Some('c'), Some("commands"), Arity::One),
+        opt(Some('n'), Some("no-config-file"), Arity::None),
+      ],
+      subcommands: BTreeMap::new(),
+      inner: Some(InnerSpec::ScriptOption { flag: "c".into() }),
     }
   }
 
@@ -585,13 +616,15 @@ pub mod testing {
     }
   }
 
-  /// git, sudo, ssh, bash.
+  /// git, sudo, timeout, ssh, bash, nu.
   pub fn declarations() -> Declarations {
     let mut d = Declarations::new();
     d.declare("git", git());
     d.declare("sudo", sudo());
+    d.declare("timeout", timeout());
     d.declare("ssh", ssh());
     d.declare("bash", bash());
+    d.declare("nu", nu());
     d
   }
 }
@@ -865,6 +898,25 @@ mod tests {
       [(s("-C"), vec![s("C")], Some((s("."), false)))]
     );
     assert_eq!(elaborate("sudo -n").inner, None);
+  }
+
+  #[test]
+  fn a_wrapper_can_skip_leading_positionals() {
+    let e = elaborate("timeout -k 5 30s git stash");
+    let Some(Inner::Command(inner)) = &e.inner else {
+      panic!("{:?}", e.inner);
+    };
+    assert_eq!(inner.name(), Some(&lit("git")));
+    assert_eq!(inner.subcommand, ["stash"]);
+    assert_eq!(elaborate("timeout 30s").inner, None);
+  }
+
+  #[test]
+  fn a_script_can_be_an_option_value() {
+    let e = elaborate("nu -n -c 'ls | length'");
+    assert_eq!(e.inner, Some(Inner::Script("ls | length".into())));
+    assert_eq!(elaborate("nu script.nu").inner, None);
+    assert_eq!(elaborate("nu -c").inner, None);
   }
 
   #[test]

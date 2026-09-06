@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::cond::{self, Env, Fs, Truth};
+use crate::elaborate::Declarations;
 use crate::input::{HookInput, Tool, string_id};
 use crate::load::{self, LoadError, Loaded, Source};
 use crate::output::Decision;
@@ -101,6 +102,9 @@ pub struct Verdict {
 /// A loaded rule table, ready to evaluate.
 pub struct Ruleset {
   pub source: Source,
+  /// Every command declaration in force. The matcher starts using them
+  /// in claude-guard-1ma.3.
+  pub declarations: Declarations,
   rules: Vec<Rule>,
 }
 
@@ -195,6 +199,7 @@ impl From<Loaded> for Ruleset {
   fn from(loaded: Loaded) -> Ruleset {
     Ruleset {
       source: loaded.source,
+      declarations: loaded.declarations,
       rules: loaded.file.rules,
     }
   }
