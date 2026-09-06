@@ -165,6 +165,65 @@ on")*
   cwd here becomes the tracked one. A rule's `:when` cannot use binders,
   since it runs before any pattern matches; the checker says so in the
   error. Made in step 3 and written here the same day.
+- **D22** — A command elaborator. Given one simple command it returns
+  `{cmd, options: [{text, flags, value?}], args, inner?}` using
+  per-command data: which flags take values, subcommands, and where an
+  inner command or script sits. Elaboration is a partition of the words:
+  every input word appears exactly once in the output, in order, and
+  flattening the output gives the input back. `git clean -fxd` is one
+  option group with text `-fxd` and flags `f`, `x`, `d`. The round-trip
+  is checked over every Bash command in the session logs, and clustering,
+  attached values, `--opt=value`, `--`, and `inner` get `check` lines.
+  *(their words: "we need to test that it gave back the same thing it was
+  given, just better classified")*
+- **D23** — Elaboration does not change the meaning of `-...`, `...`, or
+  `*`. It changes what they match on: for a declared command an option
+  word is the flag together with its value, because the arity is known.
+  `[git -... stash ...]` matches `git -C . stash` with no pattern change.
+  Undeclared commands are matched as today. *(their words: "elaboration
+  does not change the meaning of -... or ... ONLY what the match on. it
+  just improves the resutls they're matching on (we know the arity of an
+  option)")*
+- **D24** — Data, not code. Declarations live in the rule language,
+  `(command git (option "-C" :value) ...)`, with an extern elaborator over
+  stdio as the escape hatch for a command whose grammar needs real
+  parsing. Getopt rules apply to declared commands: `-fxd` splits when
+  each letter is a known short flag, a value-taking short flag swallows
+  the rest of its word or the next word, `--opt=value` splits at `=`,
+  `--` ends options. *(their words: "i'm sorta game for the data not code
+  thing")*
+- **D25** — `inner` is one mechanism for wrappers and script strings:
+  sudo, env, nice, nohup, timeout, xargs (the command after the options),
+  ssh (the positional after the host), bash, sh, nu, python3 (`-c` then
+  the first positional). The inner command or script is elaborated and
+  matched like a top-level call, so a rule holds whether it sees
+  `sudo sed ...` or `ssh nas 'bash -c "sed ..."'`. These declarations are
+  hand-written and ship built in; no completion corpus knows them.
+  *(their words: "the inner thing is nice for making rules sorta
+  automatically work whether it is `ssh nas 'batch -c "sed ..."'` or
+  `sudo sed ...`")*
+- **D26** — Start small and grow from the log. Only the D25 set ships.
+  `claude-guard commands` reads the session logs and lists every command
+  seen with call count, generic-row hits (a catch-all pattern fired
+  because `-...` stopped at a flag value), flagged calls (flag-shaped
+  words followed by a non-dash word on an undeclared command), and
+  status: built in, declared in the config dir, or undeclared, plus
+  whether carapace knows it. Sorted by the two signals, not raw count.
+  `claude-guard commands add <name>...` runs `carapace <name> export`,
+  converts its JSON (Type bool, string, stringSlice, stringArray, count;
+  NoOptDefVal; nested Commands with aliases) to
+  `~/.config/claude-guard/commands/<name>.scm`, and prints what it wrote.
+  Verified 2026-09-06: carapace-bin 1.7.3 exports every one of the 24
+  commands the rules touch; 5,199 flags across them use only those five
+  types. *(their words: "starting small and then offering a command to
+  review/pick and chose your elaborators ... a subcommand to reivew the
+  sesion and run carapace to generate the elaborator spec for the
+  command" and "it could review your sessions for hot commands where
+  elaboration could help")*
+- **D27** — Command declarations load additively: the built-in set plus
+  every file in the config `commands/` directory, the user's winning by
+  name. Unlike rules, which replace whole, a declaration is a fact about
+  a program rather than a policy.
 
 ## Scope: first version
 
