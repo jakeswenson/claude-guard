@@ -19,14 +19,20 @@
 
 (rule hard-denies
   (deny [git -... worktree ...]
-    :reason  "git worktrees are banned here."
+    :reason  "git worktrees are not used here."
     :instead "use `jj workspace add`, and ask the user before creating one.")
-  (deny [git -... stash ...]
-    :reason  "jj has no dirty tree, so there is nothing to stash."
-    :instead "use `jj new` to park the current change or `jj describe` to name it.")
   (deny [git -... checkout ...]
-    :reason  "checkout moves a git HEAD that jj does not track."
-    :instead "use `jj edit <rev>` or `jj new <rev>`.")
+    :reason  "git checkout overwrites working files and can lose uncommitted work."
+    :instead "ask the user; in a jj repo, `jj edit <rev>` or `jj new <rev>`.")
+  (deny [git -... reset ... --hard ...]
+    :reason  "git reset --hard throws away uncommitted work and moves history."
+    :instead "ask the user; `git stash` is banned too, so name what should be kept.")
+  (deny [git -... clean -* ...]
+    :reason  "git clean deletes untracked files, and with -x the ignored ones too."
+    :instead "ask the user; `git status --ignored --short` lists what it would remove.")
+  (deny [git -... branch ... -D ...]
+    :reason  "git branch -D deletes a branch whether or not it is merged."
+    :instead "ask the user; `git branch -d` refuses when work would be lost.")
   (deny [sed ...]
     :reason  "sed is banned."
     :instead "use `sd` for replacements, `rg` for searching, or the Edit tool.")
@@ -37,9 +43,19 @@
     :reason  "writing files through a cat redirect is banned."
     :instead "use the Write tool."))
 
+;; --- Ask first, and make the case ---
+
+(rule ask-first
+  (ask [jj -... abandon ...]
+    :reason  "jj abandon drops a change; its content comes back only through `jj op restore`."
+    :instead "before asking, tell the user which change this is, what it contains, and why dropping it is safe, such as where that work now lives. A bare request is not enough."))
+
 ;; --- git inside a jj repo ---
 
 (rule git-in-jj :when (ancestor-has? ".jj")
+  (deny [git -... stash ...]
+    :reason  "this repo is managed by jj, and jj has no dirty tree to stash."
+    :instead "use `jj new` to park the current change or `jj describe` to name it.")
   (deny [git -... log ...]
     :reason "this repo is managed by jj." :instead "use `jj log`.")
   (deny [git -... status ...]
@@ -104,4 +120,7 @@
     :instead "use `rg`.")
   (deny [find ...]
     :reason  "find is not the file finder here."
-    :instead "use `fd`."))
+    :instead "use `fd`.")
+  (deny [awk ...]
+    :reason  "awk is not the tool for reading or slicing files here."
+    :instead "use `bat -r 128:150 -n file` for a line range, `cut` or `nu` for fields."))

@@ -407,7 +407,7 @@ mod tests {
 
   #[test]
   fn a_verdict_names_the_row_that_fired_and_its_bindings() {
-    let verdict = run(bash("git stash"), false).unwrap();
+    let verdict = run(bash("git stash"), true).unwrap();
     assert_eq!(
       verdict.pattern,
       Some(PatternText::from("[git -... stash ...]"))
@@ -447,7 +447,13 @@ mod tests {
     let names: Vec<_> = rules.rules().iter().map(|r| r.name.to_string()).collect();
     assert_eq!(
       names,
-      ["hard-denies", "git-in-jj", "tmp-writes", "tool-nudges"]
+      [
+        "hard-denies",
+        "ask-first",
+        "git-in-jj",
+        "tmp-writes",
+        "tool-nudges"
+      ]
     );
   }
 
@@ -479,13 +485,67 @@ mod tests {
   // --- hard denies ---
 
   #[test]
-  fn git_stash_is_denied_everywhere_with_the_alternative() {
-    let reason = deny_reason(run(bash("git stash"), false));
+  fn git_checkout_is_denied_everywhere_with_the_alternative() {
+    let reason = deny_reason(run(bash("git checkout main"), false));
     assert_eq!(
       reason,
-      "claude-guard denied `git stash`: jj has no dirty tree, so there is nothing to stash. \
-       Instead: use `jj new` to park the current change or `jj describe` to name it."
+      "claude-guard denied `git checkout main`: git checkout overwrites working files and can lose \
+       uncommitted work. Instead: ask the user; in a jj repo, `jj edit <rev>` or `jj new <rev>`."
     );
+  }
+
+  #[test]
+  fn git_stash_is_denied_only_in_a_jj_repo() {
+    assert_eq!(run(bash("git stash"), false), None);
+    let reason = deny_reason(run(bash("git stash"), true));
+    assert_eq!(
+      reason,
+      "claude-guard denied `git stash`: this repo is managed by jj, and jj has no dirty tree to \
+       stash. Instead: use `jj new` to park the current change or `jj describe` to name it."
+    );
+  }
+
+  #[test]
+  fn destructive_git_commands_are_denied_everywhere() {
+    for (command, expect) in [
+      ("git reset --hard HEAD~1", "reset --hard"),
+      ("git reset HEAD~1 --hard", "reset --hard"),
+      ("git clean -fxd", "git clean deletes"),
+      ("git clean -n", "git clean deletes"),
+      ("git branch -D feature", "branch -D"),
+      ("git branch feature -D", "branch -D"),
+    ] {
+      let reason = deny_reason(run(bash(command), false));
+      assert!(reason.contains(expect), "{command}: {reason}");
+      assert_eq!(
+        rule_name(run(bash(command), false)),
+        "hard-denies",
+        "{command}"
+      );
+    }
+    // The safe forms pass outside a jj repo.
+    assert_eq!(run(bash("git reset --soft HEAD~1"), false), None);
+    assert_eq!(run(bash("git reset HEAD file"), false), None);
+    assert_eq!(run(bash("git branch -d feature"), false), None);
+    assert_eq!(run(bash("git clean"), false), None);
+  }
+
+  // --- ask first ---
+
+  #[test]
+  fn jj_abandon_asks_and_tells_the_model_to_make_the_case() {
+    let verdict = run(bash("jj abandon xyz"), true).unwrap();
+    assert_eq!(verdict.rule, RuleName::from("ask-first"));
+    let Decision::Ask { reason } = &verdict.decision else {
+      panic!("{:?}", verdict.decision);
+    };
+    assert!(
+      reason.starts_with("claude-guard asks about `jj abandon xyz`:"),
+      "{reason}"
+    );
+    assert!(reason.contains("why dropping it is safe"), "{reason}");
+    assert!(reason.contains("A bare request is not enough."), "{reason}");
+    assert_eq!(run(bash("jj describe -m x"), true), None);
   }
 
   #[test]
@@ -510,9 +570,9 @@ mod tests {
 
   #[test]
   fn a_denied_command_is_found_anywhere_in_a_pipeline_or_list() {
-    let reason = deny_reason(run(bash("ls && git stash"), false));
+    let reason = deny_reason(run(bash("ls && git checkout main"), false));
     assert!(
-      reason.starts_with("claude-guard denied `git stash`:"),
+      reason.starts_with("claude-guard denied `git checkout main`:"),
       "{reason}"
     );
     assert_eq!(
@@ -578,7 +638,10 @@ mod tests {
 
   #[test]
   fn hard_denies_win_over_the_jj_rule() {
-    assert_eq!(rule_name(run(bash("git stash"), true)), "hard-denies");
+    assert_eq!(
+      rule_name(run(bash("git checkout main"), true)),
+      "hard-denies"
+    );
   }
 
   // --- /tmp ---
@@ -654,6 +717,10 @@ mod tests {
   fn grep_and_find_are_denied_with_replacements() {
     assert!(deny_reason(run(bash("grep -r foo src"), false)).ends_with("Instead: use `rg`."));
     assert!(deny_reason(run(bash("find . -name '*.rs'"), false)).ends_with("Instead: use `fd`."));
+    assert!(
+      deny_reason(run(bash("awk 'NR>=128 && NR<=150' justfile"), false))
+        .contains("use `bat -r 128:150 -n file`")
+    );
     assert_eq!(
       rule_name(run(bash("cargo test 2>&1 | grep FAIL"), false)),
       "tool-nudges"

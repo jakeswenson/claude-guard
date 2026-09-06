@@ -88,14 +88,14 @@ fn hook_denies_git_stash_with_the_wire_format() {
   let state = state_dir();
   guard_logging_to(state.path())
     .arg("hook")
-    .write_stdin(bash_call("git stash"))
+    .write_stdin(bash_call("git checkout main"))
     .assert()
     .code(0)
     .stdout(
       "{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\
-       \"permissionDecisionReason\":\"claude-guard denied `git stash`: jj has no dirty tree, so there \
-       is nothing to stash. Instead: use `jj new` to park the current change or `jj describe` to \
-       name it.\"}}\n",
+       \"permissionDecisionReason\":\"claude-guard denied `git checkout main`: git checkout \
+       overwrites working files and can lose uncommitted work. Instead: ask the user; in a jj repo, \
+       `jj edit <rev>` or `jj new <rev>`.\"}}\n",
     )
     .stderr("");
 }
@@ -103,7 +103,7 @@ fn hook_denies_git_stash_with_the_wire_format() {
 #[test]
 fn hook_writes_one_log_line_per_call_including_passes() {
   let state = state_dir();
-  for command in ["git stash", "cargo build"] {
+  for command in ["git checkout main", "cargo build"] {
     guard_logging_to(state.path())
       .arg("hook")
       .write_stdin(bash_call(command))
@@ -126,20 +126,20 @@ fn hook_writes_one_log_line_per_call_including_passes() {
   assert_eq!(deny["agent_id"], serde_json::Value::Null);
   assert_eq!(deny["cwd"], "/Users/x/code/proj");
   assert_eq!(deny["tool"], "Bash");
-  assert_eq!(deny["subject"]["bash"]["command"], "git stash");
+  assert_eq!(deny["subject"]["bash"]["command"], "git checkout main");
   assert_eq!(
     deny["subject"]["bash"]["commands"],
-    serde_json::json!([{"words":[{"literal":"git"},{"literal":"stash"}],"redirects":[]}])
+    serde_json::json!([{"words":[{"literal":"git"},{"literal":"checkout"},{"literal":"main"}],"redirects":[]}])
   );
   assert_eq!(deny["outcome"], "deny");
   assert_eq!(deny["rule"], "hard-denies");
-  assert_eq!(deny["pattern"], "[git -... stash ...]");
+  assert_eq!(deny["pattern"], "[git -... checkout ...]");
   assert_eq!(deny["bindings"], serde_json::json!({}));
   assert!(
     deny["reason"]
       .as_str()
       .unwrap()
-      .starts_with("claude-guard denied `git stash`:")
+      .starts_with("claude-guard denied `git checkout main`:")
   );
   assert!(deny["ts"].as_str().unwrap().ends_with('Z'));
 
@@ -254,7 +254,7 @@ fn rules_reports_the_source_in_force() {
     .arg("rules")
     .assert()
     .code(0)
-    .stdout("built-in rules: 4 rules, 29 rows, 11 commands declared\n");
+    .stdout("built-in rules: 5 rules, 34 rows, 11 commands declared\n");
 
   let state = state_dir();
   let rules = state.path().join("rules.scm");
@@ -359,7 +359,7 @@ fn hook_still_denies_when_the_log_cannot_be_written() {
 
   guard_logging_to(&blocked)
     .arg("hook")
-    .write_stdin(bash_call("git stash"))
+    .write_stdin(bash_call("git checkout main"))
     .assert()
     .code(0)
     .stdout(predicate::str::contains("\"permissionDecision\":\"deny\""))
@@ -382,7 +382,7 @@ fn user_command_declarations_are_counted_and_checked() {
     .arg("rules")
     .assert()
     .code(0)
-    .stdout("built-in rules: 4 rules, 29 rows, 12 commands declared\n");
+    .stdout("built-in rules: 5 rules, 34 rows, 12 commands declared\n");
 
   fs::write(commands.join("bad.scm"), "(command git (option \"C\"))").unwrap();
   guard()

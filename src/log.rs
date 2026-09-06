@@ -503,20 +503,20 @@ mod tests {
 
   #[test]
   fn a_deny_record_is_one_line_with_every_key() {
-    let json = serde_json::to_string(&record("s1", bash("git stash"))).unwrap();
+    let json = serde_json::to_string(&record("s1", bash("git checkout main"))).unwrap();
     assert_eq!(
       json,
       concat!(
         r#"{"v":1,"ts":"2026-09-05T10:00:00Z","event":"pre_tool_use","session_id":"s1","#,
         r#""tool_use_id":"toolu_1","agent_id":null,"cwd":"/Users/x/proj","tool":"Bash","#,
-        r#""subject":{"bash":{"command":"git stash","#,
-        r#""commands":[{"words":[{"literal":"git"},{"literal":"stash"}],"redirects":[]}],"#,
-        r#""elaborated":[{"parts":[{"name":{"literal":"git"}},{"arg":{"literal":"stash"}}],"#,
+        r#""subject":{"bash":{"command":"git checkout main","#,
+        r#""commands":[{"words":[{"literal":"git"},{"literal":"checkout"},{"literal":"main"}],"redirects":[]}],"#,
+        r#""elaborated":[{"parts":[{"name":{"literal":"git"}},{"arg":{"literal":"checkout"}},{"arg":{"literal":"main"}}],"#,
         r#""declared":false,"subcommand":[],"inner":null,"redirects":[]}],"#,
         r#""uninspected":[],"parse_error":null}},"#,
-        r#""outcome":"deny","rule":"hard-denies","pattern":"[git -... stash ...]","bindings":{},"#,
-        r#""reason":"claude-guard denied `git stash`: jj has no dirty tree, so there is nothing to stash. "#,
-        r#"Instead: use `jj new` to park the current change or `jj describe` to name it."}"#,
+        r#""outcome":"deny","rule":"hard-denies","pattern":"[git -... checkout ...]","bindings":{},"#,
+        r#""reason":"claude-guard denied `git checkout main`: git checkout overwrites working files and can lose uncommitted work. "#,
+        r#"Instead: ask the user; in a jj repo, `jj edit <rev>` or `jj new <rev>`."}"#,
       )
     );
   }
