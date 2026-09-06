@@ -28,11 +28,11 @@
 //! An undeclared command elaborates as its name and arguments, so the
 //! matcher sees one shape whether or not a declaration existed.
 
-// Wired into the syntax and the matcher in claude-guard-1ma.2 and .3.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
+
+use crate::pattern::Unit;
 use crate::segment::{Redirect, SimpleCommand, Word};
 
 /// What is known about one program, or one subcommand of it.
@@ -88,9 +88,13 @@ pub struct Declarations {
 
 /// A command, classified. `parts` is the partition; everything else is
 /// derived from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Elaborated {
   pub parts: Vec<Part>,
+  /// Whether a declaration was in force. Without one every dash word is
+  /// an option to the matcher, as before elaboration existed; with one,
+  /// only the words the declaration classified as options are.
+  pub declared: bool,
   /// The subcommand path the arguments named, such as `["stash", "pop"]`
   /// for `git stash pop`. Empty when the declaration has none.
   pub subcommand: Vec<String>,
@@ -99,7 +103,8 @@ pub struct Elaborated {
   pub redirects: Vec<Redirect>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Part {
   /// The program name. Absent for a wordless command such as `> out`.
   Name(Word),
@@ -109,7 +114,7 @@ pub enum Part {
 }
 
 /// One option word with what was derived from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OptionGroup {
   /// The word as written: `-fxd`, `--git-dir=x`, `-C`.
   pub text: Word,
@@ -120,7 +125,7 @@ pub struct OptionGroup {
 }
 
 /// An option's value, and whether it lived inside the option word.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Value {
   pub text: Word,
   /// `-Cfoo` and `--git-dir=foo` are attached; `-C foo` is not, and the
@@ -129,7 +134,8 @@ pub struct Value {
 }
 
 /// What an inner declaration found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Inner {
   /// The arguments elaborated as a command of their own.
   Command(Box<Elaborated>),
@@ -167,6 +173,7 @@ impl Declarations {
 
     let mut elaborated = Elaborated {
       parts: name.into_iter().map(Part::Name).collect(),
+      declared: declaration.is_some(),
       subcommand: Vec::new(),
       inner: None,
       redirects: command.redirects.clone(),
@@ -258,7 +265,14 @@ impl Declarations {
     let args: Vec<&Word> = out.args().skip(out.subcommand.len()).collect();
     match spec {
       InnerSpec::Command { from } => {
-        let words: Vec<Word> = args.into_iter().skip(*from).cloned().collect();
+        // `env FOO=1 cmd` and `sudo FOO=1 cmd`: assignments before the
+        // command belong to the wrapper, not to the command.
+        let words: Vec<Word> = args
+          .into_iter()
+          .skip(*from)
+          .skip_while(|word| is_assignment(word))
+          .cloned()
+          .collect();
         if words.is_empty() {
           return None;
         }
@@ -291,6 +305,17 @@ impl Declarations {
       }
     }
   }
+}
+
+/// `NAME=value` with a shell identifier before the `=`.
+fn is_assignment(word: &Word) -> bool {
+  let (Word::Literal(text) | Word::Dynamic(text)) = word;
+  let Some((name, _)) = text.split_once('=') else {
+    return false;
+  };
+  let mut chars = name.chars();
+  matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+    && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
 }
 
 /// `git` from `/usr/bin/git`.
@@ -461,6 +486,48 @@ impl Elaborated {
     words
   }
 
+  /// The parts as the matcher walks them. An option group is one unit
+  /// whose elements are its canonical flags, `-f` or `--name`, then its
+  /// value; a group nothing was derived from is its text alone.
+  pub fn units(&self) -> Vec<Unit> {
+    self
+      .parts
+      .iter()
+      .map(|part| match part {
+        Part::Arg(word) if !self.declared => Unit::word(word),
+        Part::Name(word) | Part::Arg(word) => Unit {
+          elements: vec![word.clone()],
+          option: false,
+        },
+        Part::Option(group) => {
+          let mut elements: Vec<Word> = if group.flags.is_empty() {
+            vec![group.text.clone()]
+          } else {
+            group
+              .flags
+              .iter()
+              .map(|flag| {
+                Word::Literal(if flag.chars().count() == 1 {
+                  format!("-{flag}")
+                } else {
+                  format!("--{flag}")
+                })
+              })
+              .collect()
+          };
+          if let Some(value) = &group.value {
+            elements.push(value.text.clone());
+          }
+          Unit {
+            elements,
+            option: true,
+          }
+        }
+      })
+      .collect()
+  }
+
+  #[cfg(test)]
   pub fn name(&self) -> Option<&Word> {
     self.parts.iter().find_map(|part| match part {
       Part::Name(word) => Some(word),
@@ -701,6 +768,29 @@ mod tests {
   }
 
   #[test]
+  fn units_treat_dash_words_as_options_only_without_a_declaration() {
+    let undeclared = elaborate("rg -n foo -- -x");
+    let options: Vec<bool> = undeclared.units().iter().map(|u| u.option).collect();
+    assert_eq!(options, [false, true, false, true, true]);
+
+    let declared = elaborate("git commit -am wip -- -x");
+    let units = declared.units();
+    let options: Vec<bool> = units.iter().map(|u| u.option).collect();
+    assert_eq!(options, [false, false, true, true, false]);
+    assert_eq!(
+      units[2].elements,
+      vec![lit("-a"), lit("-m"), lit("wip")],
+      "a cluster's canonical flags then its value"
+    );
+    let attached = elaborate("git -C. --git-dir=x log");
+    let units = attached.units();
+    assert_eq!(units[1].elements, vec![lit("-C"), lit(".")]);
+    assert_eq!(units[2].elements, vec![lit("--git-dir"), lit("x")]);
+    let unknown = elaborate("git -zq log");
+    assert_eq!(unknown.units()[1].elements, vec![lit("-zq")]);
+  }
+
+  #[test]
   fn a_wordless_command_has_no_name() {
     let e = elaborate("> out");
     assert_eq!(e.name(), None);
@@ -897,6 +987,13 @@ mod tests {
       options(inner),
       [(s("-C"), vec![s("C")], Some((s("."), false)))]
     );
+    // Assignments before the command belong to the wrapper.
+    let e = elaborate("sudo FOO=1 BAR=x git stash");
+    let Some(Inner::Command(inner)) = &e.inner else {
+      panic!("{:?}", e.inner);
+    };
+    assert_eq!(inner.name(), Some(&lit("git")));
+    assert_eq!(elaborate("sudo FOO=1").inner, None);
     assert_eq!(elaborate("sudo -n").inner, None);
   }
 

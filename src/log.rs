@@ -16,6 +16,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
+use crate::elaborate::Elaborated;
 use crate::input::{
   AgentId, Envelope, Event, McpServer, McpTool, SessionId, Tool, ToolName, ToolUseId, WorkingDir,
   string_id,
@@ -61,6 +62,11 @@ pub enum Subject {
   Bash {
     command: String,
     commands: Vec<SimpleCommand>,
+    /// Each command as the matcher saw it: options with their values,
+    /// subcommands, inner commands and scripts. Absent on lines written
+    /// before elaboration existed.
+    #[serde(default)]
+    elaborated: Vec<Elaborated>,
     uninspected: Vec<String>,
     /// The parser's message when it refused the command. `commands` is
     /// empty in that case.
@@ -91,18 +97,21 @@ impl Subject {
       (Tool::Bash { command }, Seen::Bash(Ok(segments))) => Subject::Bash {
         command: command.clone(),
         commands: segments.commands.clone(),
+        elaborated: ctx.elaborated.clone(),
         uninspected: segments.uninspected.clone(),
         parse_error: None,
       },
       (Tool::Bash { command }, Seen::Bash(Err(e))) => Subject::Bash {
         command: command.clone(),
         commands: Vec::new(),
+        elaborated: Vec::new(),
         uninspected: Vec::new(),
         parse_error: Some(e.to_string()),
       },
       (Tool::Bash { command }, _) => Subject::Bash {
         command: command.clone(),
         commands: Vec::new(),
+        elaborated: Vec::new(),
         uninspected: Vec::new(),
         parse_error: Some("command was not segmented".into()),
       },
@@ -443,13 +452,16 @@ mod tests {
     session: &str,
     tool: Tool,
   ) -> Context {
-    Context::new(HookInput {
-      session_id: session.into(),
-      cwd: "/Users/x/proj".into(),
-      tool_use_id: "toolu_1".into(),
-      agent_id: None,
-      tool,
-    })
+    Context::new(
+      HookInput {
+        session_id: session.into(),
+        cwd: "/Users/x/proj".into(),
+        tool_use_id: "toolu_1".into(),
+        agent_id: None,
+        tool,
+      },
+      &Ruleset::builtin().declarations,
+    )
   }
 
   fn bash(command: &str) -> Tool {
@@ -479,6 +491,8 @@ mod tests {
         r#""tool_use_id":"toolu_1","agent_id":null,"cwd":"/Users/x/proj","tool":"Bash","#,
         r#""subject":{"bash":{"command":"git stash","#,
         r#""commands":[{"words":[{"literal":"git"},{"literal":"stash"}],"redirects":[]}],"#,
+        r#""elaborated":[{"parts":[{"name":{"literal":"git"}},{"arg":{"literal":"stash"}}],"#,
+        r#""declared":false,"subcommand":[],"inner":null,"redirects":[]}],"#,
         r#""uninspected":[],"parse_error":null}},"#,
         r#""outcome":"deny","rule":"hard-denies","pattern":"[git -... stash ...]","bindings":{},"#,
         r#""reason":"claude-guard denied `git stash`: jj has no dirty tree, so there is nothing to stash. "#,
@@ -621,6 +635,7 @@ mod tests {
     let Subject::Bash {
       command,
       commands,
+      elaborated,
       uninspected,
       parse_error,
     } = r.subject
@@ -629,6 +644,8 @@ mod tests {
     };
     assert_eq!(command, "ls && git stash > out 2>&1 | head $(nproc)");
     assert_eq!(commands.len(), 3);
+    assert_eq!(elaborated.len(), 3);
+    assert_eq!(elaborated[1].flatten(), commands[1].words);
     assert_eq!(
       serde_json::to_value(&commands[1]).unwrap(),
       serde_json::json!({
@@ -655,6 +672,7 @@ mod tests {
       Subject::Bash {
         command: "git stash &&".into(),
         commands: Vec::new(),
+        elaborated: Vec::new(),
         uninspected: Vec::new(),
         parse_error: Some("syntax error at end of input".into()),
       }

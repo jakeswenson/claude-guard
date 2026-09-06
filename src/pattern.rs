@@ -16,9 +16,16 @@
 //!
 //! A dynamic word never matches a literal, an option wildcard, or a
 //! binder: a condition needs the text, and the shell has not produced it
-//! yet. Patterns know nothing about which flags take values, so
-//! `git -C . stash` does not match `git -... stash ...`. Authors who want
-//! that write `git ... stash ...` and accept the looser match.
+//! yet.
+//!
+//! The matcher walks [`Unit`]s, which the elaborator builds from a
+//! declared command: an option with its value is one unit whose elements
+//! are the canonical flag and the value, so `-...` takes `-C .` whole and
+//! `[git -C ?dir]` binds under `-C .` and `-C.` alike. Without a
+//! declaration every word is a unit of one element and the tokens behave
+//! as they always did: `git -C . stash` does not match
+//! `[git -... stash ...]`, because `.` is an argument. The tokens keep
+//! their meaning either way; elaboration changes what they see.
 //!
 //! The rule file syntax in [`syntax`] builds patterns; this module only
 //! matches them. The executable spec in `spec/patterns.scm` is the
@@ -111,19 +118,40 @@ impl Pattern {
     !self.bindings(command).is_empty()
   }
 
-  /// Every distinct way the pattern matches `command`, as what its
-  /// binders captured. Empty means no match. A binder that appears twice
-  /// must capture the same word both times.
+  /// Every distinct way the pattern matches `command` with no declaration
+  /// in force: each word is one unit, and a dash word is an option unit.
+  /// Empty means no match. A binder that appears twice must capture the
+  /// same word both times.
   pub fn bindings(
     &self,
     command: &SimpleCommand,
   ) -> Vec<Bindings> {
+    let units: Vec<Unit> = command.words.iter().map(Unit::word).collect();
+    self.bindings_in(&units, &command.redirects)
+  }
+
+  /// Every distinct way the pattern matches the elaborated `units` and
+  /// `redirects`. See the module docs for what each token takes.
+  pub fn bindings_in(
+    &self,
+    units: &[Unit],
+    redirects: &[Redirect],
+  ) -> Vec<Bindings> {
     let mut found = Vec::new();
-    bind_words(&self.words, &command.words, Bindings::new(), &mut found);
+    bind_units(
+      &self.words,
+      units,
+      Cursor {
+        unit: 0,
+        element: 0,
+      },
+      Bindings::new(),
+      &mut found,
+    );
     for wanted in &self.redirects {
       let mut next = Vec::new();
       for bound in &found {
-        for redirect in &command.redirects {
+        for redirect in redirects {
           if let Some(extended) = wanted.bind(redirect, bound) {
             push_unique(&mut next, extended);
           }
@@ -144,45 +172,159 @@ fn push_unique(
   }
 }
 
-/// Match a token sequence against a word sequence, collecting every
-/// binding set that reaches the end. `...` and `-...` try every length
-/// they could take, shortest first, so a pattern may hold several of them.
-fn bind_words(
+/// What the matcher walks: one argument, or one option with its value.
+/// An elaborated option group's elements are its canonical flags and
+/// value, so `-fxd` is `-f`, `-x`, `-d` and `-C.` is `-C`, `.`. A word
+/// with no declaration behind it is a unit of one element.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unit {
+  pub elements: Vec<Word>,
+  /// True for an option unit: what `-*` and `-...` take.
+  pub option: bool,
+}
+
+impl Unit {
+  /// One word, as the matcher saw it before elaboration existed: a
+  /// literal starting with `-` is an option, anything else is not.
+  pub fn word(word: &Word) -> Unit {
+    Unit {
+      option: matches!(word, Word::Literal(text) if text.starts_with('-')),
+      elements: vec![word.clone()],
+    }
+  }
+}
+
+/// A position in the unit list: the unit, and the element within it.
+/// `element` is 0 at a unit boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Cursor {
+  unit: usize,
+  element: usize,
+}
+
+impl Cursor {
+  fn at_end(
+    self,
+    units: &[Unit],
+  ) -> bool {
+    self.unit >= units.len()
+  }
+
+  fn at_boundary(self) -> bool {
+    self.element == 0
+  }
+
+  fn current(
+    self,
+    units: &[Unit],
+  ) -> Option<&Word> {
+    units.get(self.unit)?.elements.get(self.element)
+  }
+
+  /// One element on, crossing into the next unit when this one is done.
+  fn next_element(
+    self,
+    units: &[Unit],
+  ) -> Cursor {
+    let len = units.get(self.unit).map_or(0, |u| u.elements.len());
+    if self.element + 1 >= len {
+      Cursor {
+        unit: self.unit + 1,
+        element: 0,
+      }
+    } else {
+      Cursor {
+        unit: self.unit,
+        element: self.element + 1,
+      }
+    }
+  }
+
+  fn next_unit(self) -> Cursor {
+    Cursor {
+      unit: self.unit + 1,
+      element: 0,
+    }
+  }
+}
+
+/// Match a token sequence from `at`, collecting every binding set that
+/// reaches the end. `...` and `-...` try every length they could take,
+/// shortest first, so a pattern may hold several of them.
+///
+/// `*`, `-*`, and `-...` take whole units and only from a unit boundary;
+/// a literal, a binder, and `...` walk elements, so a literal can look
+/// inside a cluster and a binder can take the value after a flag.
+fn bind_units(
   tokens: &[Token],
-  words: &[Word],
+  units: &[Unit],
+  at: Cursor,
   bound: Bindings,
   out: &mut Vec<Bindings>,
 ) {
   let Some((first, rest)) = tokens.split_first() else {
-    if words.is_empty() {
+    if at.at_end(units) {
       push_unique(out, bound);
     }
     return;
   };
   match first {
     Token::Rest => {
-      for n in 0..=words.len() {
-        bind_words(rest, &words[n..], bound.clone(), out);
+      let mut here = at;
+      loop {
+        bind_units(rest, units, here, bound.clone(), out);
+        if here.at_end(units) {
+          break;
+        }
+        here = here.next_element(units);
       }
     }
     Token::Options => {
-      let limit = words.iter().take_while(|w| is_option(w)).count();
-      for n in 0..=limit {
-        bind_words(rest, &words[n..], bound.clone(), out);
+      if !at.at_boundary() {
+        return;
+      }
+      let mut here = at;
+      loop {
+        bind_units(rest, units, here, bound.clone(), out);
+        match units.get(here.unit) {
+          Some(unit) if unit.option && is_literal(&unit.elements[0]) => here = here.next_unit(),
+          _ => break,
+        }
       }
     }
-    single => {
-      if let Some((word, tail)) = words.split_first()
-        && let Some(next) = single.bind_one(word, &bound)
+    Token::Any => {
+      if at.at_end(units) {
+        return;
+      }
+      // A whole unit from a boundary; one element from inside a unit.
+      let next = if at.at_boundary() {
+        at.next_unit()
+      } else {
+        at.next_element(units)
+      };
+      bind_units(rest, units, next, bound, out);
+    }
+    Token::Option => {
+      if let Some(unit) = units.get(at.unit)
+        && at.at_boundary()
+        && unit.option
+        && is_literal(&unit.elements[0])
       {
-        bind_words(rest, tail, next, out);
+        bind_units(rest, units, at.next_unit(), bound, out);
+      }
+    }
+    Token::Literal(_) | Token::Var(_) => {
+      if let Some(word) = at.current(units)
+        && let Some(next) = first.bind_one(word, &bound)
+      {
+        bind_units(rest, units, at.next_element(units), next, out);
       }
     }
   }
 }
 
-fn is_option(word: &Word) -> bool {
-  matches!(word, Word::Literal(text) if text.starts_with('-'))
+fn is_literal(word: &Word) -> bool {
+  matches!(word, Word::Literal(_))
 }
 
 impl Token {

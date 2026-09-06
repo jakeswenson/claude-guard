@@ -14,12 +14,12 @@
 use std::path::{Path, PathBuf};
 
 use crate::cond::{self, Env, Fs, Truth};
-use crate::elaborate::Declarations;
+use crate::elaborate::{Declarations, Elaborated, Inner};
 use crate::input::{HookInput, Tool, string_id};
 use crate::load::{self, LoadError, Loaded, Source};
 use crate::output::Decision;
-use crate::pattern::{self, Bindings};
-use crate::segment::{self, RedirectKind, SegmentError, Segments, SimpleCommand, Word};
+use crate::pattern::{self, Bindings, Pattern};
+use crate::segment::{self, RedirectKind, SegmentError, Segments, Word};
 use crate::syntax::{FileTool, PathArg, Row, Rule, Subject};
 
 /// A row's decision kind.
@@ -35,6 +35,9 @@ pub enum Kind {
 pub struct Context {
   pub input: HookInput,
   pub seen: Seen,
+  /// Each simple command of a Bash call, elaborated under the
+  /// declarations in force. Empty for every other tool.
+  pub elaborated: Vec<Elaborated>,
 }
 
 /// The part of the tool input the rules look at.
@@ -46,8 +49,12 @@ pub enum Seen {
 }
 
 impl Context {
-  /// Segment a Bash command, or note the file a file tool touches.
-  pub fn new(input: HookInput) -> Context {
+  /// Segment and elaborate a Bash command, or note the file a file tool
+  /// touches.
+  pub fn new(
+    input: HookInput,
+    declarations: &Declarations,
+  ) -> Context {
     let seen = match &input.tool {
       Tool::Bash { command } => Seen::Bash(segment::segment(command)),
       Tool::Write { path } => Seen::File {
@@ -72,7 +79,19 @@ impl Context {
       | Tool::Mcp { .. }
       | Tool::Other { .. } => Seen::Other,
     };
-    Context { input, seen }
+    let elaborated = match &seen {
+      Seen::Bash(Ok(segments)) => segments
+        .commands
+        .iter()
+        .map(|command| declarations.elaborate(command))
+        .collect(),
+      _ => Vec::new(),
+    };
+    Context {
+      input,
+      seen,
+      elaborated,
+    }
   }
 }
 
@@ -161,7 +180,7 @@ impl Ruleset {
         continue;
       }
       for row in &rule.rows {
-        if let Some((what, bindings)) = find(row, &ctx.seen, &env) {
+        if let Some((what, bindings)) = find(row, ctx, &self.declarations, &env) {
           return Some(Verdict {
             rule: rule.name.clone(),
             pattern: Some(PatternText::from(row.subject.to_string())),
@@ -205,20 +224,23 @@ impl From<Loaded> for Ruleset {
   }
 }
 
+/// How far into wrappers and scripts a row looks: `ssh` carrying
+/// `bash -c` carrying `sudo` is three.
+const INNER_DEPTH: usize = 8;
+
 /// The text of what matched and the bindings that satisfied the row's
 /// condition, or `None`.
 fn find(
   row: &Row,
-  seen: &Seen,
+  ctx: &Context,
+  declarations: &Declarations,
   env: &Env<'_>,
 ) -> Option<(String, Bindings)> {
-  match (&row.subject, seen) {
-    (Subject::Command(pattern), Seen::Bash(Ok(segments))) => {
-      segments.commands.iter().find_map(|command| {
-        let chosen = cond::choose(row.when.as_ref(), pattern.bindings(command), env)?;
-        Some((describe(command), chosen))
-      })
-    }
+  match (&row.subject, &ctx.seen) {
+    (Subject::Command(pattern), Seen::Bash(Ok(_))) => ctx
+      .elaborated
+      .iter()
+      .find_map(|command| find_in(row, pattern, command, declarations, env, 0)),
     (Subject::Tool(wanted), Seen::File { tool, path }) if wanted.tool == *tool => {
       let text = path.to_string_lossy().into_owned();
       let candidate = match &wanted.path {
@@ -234,6 +256,37 @@ fn find(
       Some((text, chosen))
     }
     _ => None,
+  }
+}
+
+/// Match `pattern` against one elaborated command, then against whatever
+/// it carries: an inner command as is, an inner script segmented and
+/// elaborated first. The first hit wins, outermost first.
+fn find_in(
+  row: &Row,
+  pattern: &Pattern,
+  command: &Elaborated,
+  declarations: &Declarations,
+  env: &Env<'_>,
+  depth: usize,
+) -> Option<(String, Bindings)> {
+  let candidates = pattern.bindings_in(&command.units(), &command.redirects);
+  if let Some(chosen) = cond::choose(row.when.as_ref(), candidates, env) {
+    return Some((describe(command), chosen));
+  }
+  if depth >= INNER_DEPTH {
+    return None;
+  }
+  match &command.inner {
+    Some(Inner::Command(inner)) => find_in(row, pattern, inner, declarations, env, depth + 1),
+    Some(Inner::Script(text)) => {
+      let segments = segment::segment(text).ok()?;
+      segments.commands.iter().find_map(|simple| {
+        let inner = declarations.elaborate(simple);
+        find_in(row, pattern, &inner, declarations, env, depth + 1)
+      })
+    }
+    None => None,
   }
 }
 
@@ -259,10 +312,10 @@ fn render(
   }
 }
 
-/// A simple command as one line: words, then redirects.
-fn describe(command: &SimpleCommand) -> String {
+/// A command as one line: words as given, then redirects.
+fn describe(command: &Elaborated) -> String {
   let mut parts: Vec<String> = command
-    .words
+    .flatten()
     .iter()
     .map(|word| match word {
       Word::Literal(text) | Word::Dynamic(text) => text.clone(),
@@ -331,7 +384,11 @@ mod tests {
     tool: Tool,
     in_jj_repo: bool,
   ) -> Option<Verdict> {
-    Ruleset::builtin().evaluate(&Context::new(input(tool)), &repo(in_jj_repo))
+    let rules = Ruleset::builtin();
+    rules.evaluate(
+      &Context::new(input(tool), &rules.declarations),
+      &repo(in_jj_repo),
+    )
   }
 
   fn deny_reason(verdict: Option<Verdict>) -> String {
@@ -495,7 +552,9 @@ mod tests {
     let generic = "or `jj git <subcommand>` for remote operations.";
     let reason = deny_reason(run(bash("git reflog"), true));
     assert!(reason.ends_with(generic), "{reason}");
-    // A flag with a value hides the subcommand from `-...`, by design.
+    // git ships with no declaration, so `-...` stops at `-C`'s value and
+    // the generic row catches it. `claude-guard commands add git` fixes
+    // that; see a_declared_flag_value_no_longer_hides_the_subcommand.
     let reason = deny_reason(run(bash("git -C . push origin main"), true));
     assert!(reason.ends_with(generic), "{reason}");
     let reason = deny_reason(run(bash("git $cmd"), true));
@@ -556,7 +615,8 @@ mod tests {
   fn a_relative_target_counts_when_cwd_is_under_tmp() {
     let mut input = input(bash("echo hi > out.txt"));
     input.cwd = "/tmp/work".into();
-    let verdict = Ruleset::builtin().evaluate(&Context::new(input), &repo(false));
+    let rules = Ruleset::builtin();
+    let verdict = rules.evaluate(&Context::new(input, &rules.declarations), &repo(false));
     assert_eq!(rule_name(verdict), "tmp-writes");
   }
 
@@ -672,9 +732,98 @@ mod tests {
     text: &str,
     tool: Tool,
   ) -> Option<Verdict> {
-    Ruleset::from_text(text)
-      .unwrap_or_else(|e| panic!("{e}"))
-      .evaluate(&Context::new(input(tool)), &repo(false))
+    let rules = Ruleset::from_text(text).unwrap_or_else(|e| panic!("{e}"));
+    rules.evaluate(
+      &Context::new(input(tool), &rules.declarations),
+      &repo(false),
+    )
+  }
+
+  // --- elaboration: declared commands and inner commands ---
+
+  const GIT_DECLARED: &str = r#"
+    (command git (option "-C" :value) (option "-P" "--no-pager")
+      (subcommand clean (option "-f") (option "-x") (option "-d")))
+    (rule git
+      (deny [git -... push ...] :reason "push." :instead "jj git push.")
+      (deny [git -... clean -f ...] :reason "clean." :instead "jj.")
+      (deny [git -C ?dir ...] :when (under? ?dir "/tmp") :reason "tmp git." :instead "no.")
+      (deny [git ...] :reason "generic." :instead "jj."))
+  "#;
+
+  #[test]
+  fn a_declared_flag_value_no_longer_hides_the_subcommand() {
+    let reason = deny_reason(run_with(GIT_DECLARED, bash("git -C . push origin main")));
+    assert!(reason.ends_with("push. Instead: jj git push."), "{reason}");
+    assert!(
+      reason.starts_with("claude-guard denied `git -C . push origin main`:"),
+      "{reason}"
+    );
+    // The same command with no declaration still falls to the generic row.
+    let undeclared = GIT_DECLARED.replacen("(command git", "(command gut", 1);
+    let reason = deny_reason(run_with(&undeclared, bash("git -C . push origin main")));
+    assert!(reason.ends_with("generic. Instead: jj."), "{reason}");
+  }
+
+  #[test]
+  fn a_literal_finds_a_flag_inside_a_cluster() {
+    let reason = deny_reason(run_with(GIT_DECLARED, bash("git clean -fxd")));
+    assert!(reason.ends_with("clean. Instead: jj."), "{reason}");
+    let reason = deny_reason(run_with(GIT_DECLARED, bash("git clean -xd")));
+    assert!(reason.ends_with("generic. Instead: jj."), "{reason}");
+  }
+
+  #[test]
+  fn a_binder_takes_an_option_value_under_either_spelling() {
+    for command in ["git -C /tmp/x log", "git -C/tmp/x log"] {
+      let verdict = run_with(GIT_DECLARED, bash(command)).unwrap();
+      assert_eq!(
+        verdict.pattern,
+        Some(PatternText::from("[git -C ?dir ...]")),
+        "{command}"
+      );
+      assert_eq!(
+        verdict.bindings,
+        Bindings::from([(Var::from("dir"), "/tmp/x".to_string())])
+      );
+    }
+  }
+
+  #[test]
+  fn a_rule_holds_through_wrappers_and_scripts() {
+    for command in [
+      "sudo sed -i s/a/b/ file",
+      "sudo -u root env FOO=1 sed -i s/a/b/ file",
+      "ssh nas 'sed -i s/a/b/ file'",
+      "ssh -o ConnectTimeout=10 nas sed -i s/a/b/ file",
+      "bash -c 'cd /x && sed -i s/a/b/ file'",
+      "nu -c 'sed -i s/a/b/ file'",
+      "timeout 5s sed -i s/a/b/ file",
+      "ssh nas \"bash -c 'sudo sed -i s/a/b/ file'\"",
+    ] {
+      let reason = deny_reason(run(bash(command), false));
+      assert!(
+        reason.starts_with("claude-guard denied `sed -i s/a/b/ file`:"),
+        "{command}: {reason}"
+      );
+    }
+    // The wrapper's own options never reach the inner command.
+    assert_eq!(run(bash("sudo -u sed ls"), false), None);
+    assert_eq!(run(bash("bash script-that-mentions-sed.sh"), false), None);
+  }
+
+  #[test]
+  fn the_outermost_match_wins() {
+    let reason = deny_reason(run(bash("sudo grep foo $(cat x)"), false));
+    assert!(
+      reason.starts_with("claude-guard denied `grep foo $(cat x)`:"),
+      "{reason}"
+    );
+    let reason = deny_reason(run(bash("sudo -n git stash"), true));
+    assert!(
+      reason.starts_with("claude-guard denied `git stash`:"),
+      "{reason}"
+    );
   }
 
   #[test]
@@ -740,9 +889,7 @@ mod tests {
   #[test]
   fn describe_renders_words_and_redirects() {
     let segments = segment::segment("echo \"hi there\" > /tmp/x 2>> err").unwrap();
-    assert_eq!(
-      describe(&segments.commands[0]),
-      "echo hi there > /tmp/x >> err"
-    );
+    let elaborated = Declarations::new().elaborate(&segments.commands[0]);
+    assert_eq!(describe(&elaborated), "echo hi there > /tmp/x >> err");
   }
 }

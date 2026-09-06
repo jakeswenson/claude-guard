@@ -168,6 +168,24 @@ fn a_binding_row_records_what_it_captured() {
   assert_eq!(line["bindings"], serde_json::json!({"dst": "/tmp/dist"}));
 }
 
+#[test]
+fn a_rule_holds_through_a_wrapper_and_names_the_inner_command() {
+  let state = state_dir();
+  guard_logging_to(state.path())
+    .arg("hook")
+    .write_stdin(bash_call("ssh nas 'sudo sed -i s/a/b/ /etc/hosts'"))
+    .assert()
+    .code(0)
+    .stdout(predicate::str::contains(
+      "claude-guard denied `sed -i s/a/b/ /etc/hosts`: sed is banned.",
+    ));
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let line: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+  let outer = &line["subject"]["bash"]["elaborated"][0];
+  assert_eq!(outer["declared"], true);
+  assert_eq!(outer["inner"]["script"], "sudo sed -i s/a/b/ /etc/hosts");
+}
+
 // --- the rule file ---
 
 #[test]

@@ -198,7 +198,11 @@ on")*
   the first positional). The inner command or script is elaborated and
   matched like a top-level call, so a rule holds whether it sees
   `sudo sed ...` or `ssh nas 'bash -c "sed ..."'`. These declarations are
-  hand-written and ship built in; no completion corpus knows them.
+  hand-written and ship built in; no completion corpus knows them. A
+  wrapper stops taking its own options at its first positional, and
+  `NAME=value` words before the inner command belong to the wrapper, so
+  `env FOO=1 sed` and `sudo FOO=1 sed` both reach `sed`. Matching looks
+  outermost first, at most eight levels deep. Made in steps 1 and 3.
   *(their words: "the inner thing is nice for making rules sorta
   automatically work whether it is `ssh nas 'batch -c "sed ..."'` or
   `sudo sed ...`")*

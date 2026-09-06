@@ -176,7 +176,7 @@ fn pre_tool_use(raw: &str) -> Result<()> {
     }
   };
   let input = input::parse(raw)?;
-  let ctx = rules::Context::new(input);
+  let ctx = rules::Context::new(input, &rules.declarations);
   let verdict = rules.evaluate(&ctx, &cond::RealFs);
 
   record(log::Record::pre_tool_use(
