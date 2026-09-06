@@ -143,6 +143,20 @@ impl fmt::Display for LoadError {
 
 impl std::error::Error for LoadError {}
 
+/// The user commands directory `commands add` writes to, per the module
+/// docs. `None` without a home to put it under.
+pub fn commands_dir_from_env() -> Option<PathBuf> {
+  let config = config_dir(var_os("XDG_CONFIG_HOME"), var_os("HOME"));
+  resolve_commands_dir(var_os(COMMANDS_DIR_ENV), config.as_deref())
+}
+
+/// The names the built-in declarations cover.
+pub fn builtin_command_names() -> std::collections::BTreeSet<String> {
+  parse_text(Source::BuiltinCommands, BUILTIN_COMMANDS)
+    .map(|file| file.commands.into_iter().map(|c| c.name).collect())
+    .unwrap_or_default()
+}
+
 /// Load everything in force, per the module docs.
 pub fn from_env() -> Result<Loaded, LoadError> {
   let config = config_dir(var_os("XDG_CONFIG_HOME"), var_os("HOME"));

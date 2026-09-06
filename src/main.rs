@@ -6,6 +6,7 @@
 //! - stdout carries a decision only when a rule speaks
 //! - stderr carries diagnostics, visible with `claude --debug`
 
+mod commands;
 mod cond;
 mod elaborate;
 mod input;
@@ -25,6 +26,7 @@ use std::process::ExitCode;
 
 use color_eyre::config::{HookBuilder, Theme};
 use color_eyre::eyre::{Result, WrapErr, bail};
+use commands::Carapace as _;
 use log::{Reader as _, Writer as _};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -35,6 +37,8 @@ const LOG_ENV: &str = "CLAUDE_GUARD_LOG";
 
 const USAGE: &str = "usage: claude-guard <hook|session-start>  (reads hook JSON on stdin)\n       \
                      claude-guard rules [--export]     (check the rules in force, or print the built-in file)\n       \
+                     claude-guard commands             (which programs the sessions run, and what the guard knows)\n       \
+                     claude-guard commands add [--force] [--stdout] <name>...  (declare a program from carapace)\n       \
                      claude-guard elaborate --check-log (round-trip every logged command through the elaborator)";
 
 fn main() -> ExitCode {
@@ -86,6 +90,7 @@ fn run(args: &[String]) -> Result<()> {
     "hook" => hook(&stdin()?),
     "session-start" => session_start(&stdin()?),
     "rules" => rules_command(rest),
+    "commands" => commands_command(rest),
     "elaborate" => elaborate_command(rest),
     other => {
       eprintln!("{USAGE}");
@@ -132,6 +137,91 @@ fn rules_command(args: &[String]) -> Result<()> {
     _ => {
       eprintln!("{USAGE}");
       bail!("unknown arguments to `rules`");
+    }
+  }
+}
+
+/// `commands` prints the survey table; `commands add` writes declarations
+/// from carapace. Both keep the exit code at zero; problems are lines on
+/// stderr.
+fn commands_command(args: &[String]) -> Result<()> {
+  let carapace = commands::Binary::from_env();
+  match args.split_first().map(|(a, rest)| (a.as_str(), rest)) {
+    None => {
+      let rules = match rules::Ruleset::load() {
+        Ok(rules) => rules,
+        Err(e) => {
+          eprintln!("{e}");
+          return Ok(());
+        }
+      };
+      let store = log::Store::from_env()?;
+      let mut records = Vec::new();
+      for session_id in store.session_ids()? {
+        records.extend(store.session(&session_id)?);
+      }
+      let listed = match carapace.list() {
+        Ok(listed) => Some(listed),
+        Err(e) => {
+          eprintln!("claude-guard: carapace column unavailable: {}", chain(&e));
+          None
+        }
+      };
+      let builtin = load::builtin_command_names();
+      let declared: std::collections::BTreeSet<String> =
+        rules.declarations.by_name.keys().cloned().collect();
+      let specific = commands::specific_programs(rules.rules());
+      let rows = commands::survey(
+        &records,
+        &commands::Known {
+          builtin: &builtin,
+          declared: &declared,
+          specific: &specific,
+          carapace: listed.as_ref(),
+        },
+      );
+      print!("{}", commands::render(&rows));
+      Ok(())
+    }
+    Some(("add", rest)) => {
+      let force = rest.iter().any(|a| a == "--force");
+      let to_stdout = rest.iter().any(|a| a == "--stdout");
+      let names: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+      if names.is_empty() {
+        eprintln!("{USAGE}");
+        bail!("`commands add` needs at least one program name");
+      }
+      let dir = load::commands_dir_from_env();
+      let today = jiff::Zoned::now().date().to_string();
+      let mut print = |text: &str| print!("{text}");
+      for name in names {
+        match commands::add(
+          name,
+          &carapace,
+          dir.as_deref(),
+          force,
+          to_stdout,
+          &today,
+          &mut print,
+        ) {
+          Ok(commands::Added::Written {
+            path,
+            options,
+            subcommands,
+          }) => eprintln!("{name}: wrote {path} ({options} options, {subcommands} subcommands)"),
+          Ok(commands::Added::Printed {
+            options,
+            subcommands,
+          }) => eprintln!("{name}: {options} options, {subcommands} subcommands"),
+          Ok(commands::Added::Skipped(why)) => eprintln!("{name}: skipped, {why}"),
+          Err(e) => eprintln!("{name}: {}", chain(&e)),
+        }
+      }
+      Ok(())
+    }
+    Some(_) => {
+      eprintln!("{USAGE}");
+      bail!("unknown arguments to `commands`");
     }
   }
 }

@@ -428,6 +428,59 @@ fn elaborate_check_log_round_trips_every_logged_command() {
 }
 
 #[test]
+fn commands_surveys_the_logs_without_carapace() {
+  let state = state_dir();
+  for command in ["git -C . push", "git stash", "rg -n foo src", "sudo ls"] {
+    guard_logging_to(state.path())
+      .arg("hook")
+      .write_stdin(bash_call(command))
+      .assert()
+      .code(0);
+  }
+  guard_logging_to(state.path())
+    .env("XDG_CONFIG_HOME", state_dir().path())
+    .env("CLAUDE_GUARD_CARAPACE", "/definitely/not/carapace")
+    .arg("commands")
+    .assert()
+    .code(0)
+    .stdout(predicate::str::starts_with(
+      "command  calls  generic-hits  flagged  status      carapace\n\
+       git          2             0        1  undeclared  ?\n\
+       rg           1             0        1  undeclared  ?\n",
+    ))
+    .stdout(predicate::str::contains(
+      "sudo         1             0        0  built-in    ?\n",
+    ))
+    .stderr(predicate::str::contains("carapace column unavailable"));
+}
+
+#[test]
+fn commands_add_reports_a_missing_carapace() {
+  let state = state_dir();
+  guard()
+    .env("CLAUDE_GUARD_COMMANDS_DIR", state.path())
+    .env("CLAUDE_GUARD_CARAPACE", "/definitely/not/carapace")
+    .arg("commands")
+    .arg("add")
+    .arg("git")
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains(
+      "git: run `/definitely/not/carapace git export`",
+    ))
+    .stderr(predicate::str::contains("install carapace-bin"));
+  assert!(!state.path().join("git.scm").exists());
+
+  guard()
+    .arg("commands")
+    .arg("add")
+    .assert()
+    .code(0)
+    .stderr(predicate::str::contains("needs at least one program name"));
+}
+
+#[test]
 fn session_start_with_garbage_stdin_exits_zero() {
   guard()
     .arg("session-start")
