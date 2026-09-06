@@ -7,6 +7,7 @@
 //! - stderr carries diagnostics, visible with `claude --debug`
 
 mod cond;
+mod elaborate;
 mod input;
 mod load;
 mod log;
