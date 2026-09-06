@@ -140,6 +140,24 @@ on")*
   after pattern matching the command so that you can extract out the file
   being read/written?" and "should it be like `in-jj-repo?` or isn't that
   common lisp/scheme for functions like that?")*
+- **D19** — A binder captures one literal word and never a dynamic one:
+  a condition needs the text, and the shell has not produced it. Rows
+  that must catch dynamic words use `*` or `...`. A binder that appears
+  twice must capture the same word both times, so `[cp ?x ?x]` matches
+  `cp a a` and not `cp a b`, the Prolog reading. Implemented in step 2
+  before it was written here; both facts get `check` lines in step 5.
+  *(their words, on the missing write-up: "first decisions like that need
+  to be documented")*
+- **D20** — Near misses are logged. A pattern is a near miss when it
+  matches with dynamic words allowed to stand in for any token and does
+  not match strictly. The record for a pass lists each near miss with the
+  rule, the pattern, and the dynamic words that made the difference, so
+  the review UI can show why a rule did not fire and escalation can
+  treat "`$cmd` could be `stash`" as a stronger signal than a bare
+  `$(...)` warning. Whether a near miss speaks to the model is a rule
+  decision for later. *(their words: "should a rule that doesn't bind for
+  reasons like this (had a dynamic word) be logged/tracked so that the
+  reason a rule didn't match is inspectable?")*
 
 ## Scope: first version
 

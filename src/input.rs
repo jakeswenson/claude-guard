@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! string_id {
   ($(#[$doc:meta])* $name:ident) => {
     $(#[$doc])*
-    #[derive(Debug, Clone, PartialEq, Eq, Hash, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct $name(String);
 

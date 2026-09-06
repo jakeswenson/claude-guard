@@ -11,29 +11,48 @@
 //! | `-*`        | exactly one literal word starting with `-`         |
 //! | `-...`      | zero or more literal words each starting with `-`  |
 //! | `<path>/**` | one literal word whose normalized path is under `<path>` |
+//! | `?name`     | one literal word, bound to `name` for the row's condition |
 //! | anything else | one literal word, byte-equal after quote removal |
 //!
 //! A redirect in a pattern must find a redirect on the command, in any
 //! position. `> X` accepts a write or an append; `>> X` accepts an append
 //! only; `< X` accepts a read. The target takes the same wildcards.
 //!
-//! A dynamic word never matches a literal, a path prefix, or an option
-//! wildcard. Patterns know nothing about which flags take values, so
-//! `git -C . stash` does not match `git -... stash ...`. Authors who want
-//! that write `git ... stash ...` and accept the looser match.
+//! A dynamic word never matches a literal, a path prefix, an option
+//! wildcard, or a binder: a condition needs the text, and the shell has
+//! not produced it yet. Patterns know nothing about which flags take
+//! values, so `git -C . stash` does not match `git -... stash ...`.
+//! Authors who want that write `git ... stash ...` and accept the looser
+//! match.
+//!
+//! Two ways to build one: [`Pattern::parse`] reads the bash string form
+//! the Rust table uses, and [`Pattern::from_tokens`] takes tokens the rule
+//! file syntax already split. Both match the same way.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use crate::input::string_id;
 use crate::segment::{self, Redirect, RedirectKind, SimpleCommand, Word};
 
-/// A parsed pattern. Build one with [`Pattern::parse`].
+/// A parsed pattern.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
   source: String,
   words: Vec<Token>,
   redirects: Vec<RedirectPattern>,
 }
+
+string_id! {
+  /// A binder's name, without the `?`.
+  Var
+}
+
+/// What each binder in a pattern captured, one word per name. A pattern
+/// with no binders yields one empty map per way it matches, deduplicated
+/// to one.
+pub type Bindings = BTreeMap<Var, String>;
 
 /// What one pattern word matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,13 +69,15 @@ pub enum Token {
   Options,
   /// `<path>/**`: one literal word whose normalized path is under `path`.
   Under(PathBuf),
+  /// `?name`: one literal word, captured under `name`.
+  Var(Var),
 }
 
 /// A redirect the command must carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RedirectPattern {
-  kind: RedirectKind,
-  target: Token,
+  pub kind: RedirectKind,
+  pub target: Token,
 }
 
 /// The pattern text is not one plain simple command.
@@ -121,17 +142,59 @@ impl Pattern {
     })
   }
 
+  /// A pattern from tokens already split by another syntax. `source` is
+  /// what [`fmt::Display`] shows and what the log records.
+  pub fn from_tokens(
+    source: String,
+    words: Vec<Token>,
+    redirects: Vec<RedirectPattern>,
+  ) -> Pattern {
+    Pattern {
+      source,
+      words,
+      redirects,
+    }
+  }
+
   /// True when every pattern word and redirect finds its counterpart on
   /// `command`.
   pub fn matches(
     &self,
     command: &SimpleCommand,
   ) -> bool {
-    match_words(&self.words, &command.words)
-      && self
-        .redirects
-        .iter()
-        .all(|wanted| command.redirects.iter().any(|found| wanted.matches(found)))
+    !self.bindings(command).is_empty()
+  }
+
+  /// Every distinct way the pattern matches `command`, as what its
+  /// binders captured. Empty means no match. A binder that appears twice
+  /// must capture the same word both times.
+  pub fn bindings(
+    &self,
+    command: &SimpleCommand,
+  ) -> Vec<Bindings> {
+    let mut found = Vec::new();
+    bind_words(&self.words, &command.words, Bindings::new(), &mut found);
+    for wanted in &self.redirects {
+      let mut next = Vec::new();
+      for bound in &found {
+        for redirect in &command.redirects {
+          if let Some(extended) = wanted.bind(redirect, bound) {
+            push_unique(&mut next, extended);
+          }
+        }
+      }
+      found = next;
+    }
+    found
+  }
+}
+
+fn push_unique(
+  out: &mut Vec<Bindings>,
+  bindings: Bindings,
+) {
+  if !out.contains(&bindings) {
+    out.push(bindings);
   }
 }
 
@@ -163,26 +226,40 @@ fn token(word: Word) -> Result<Token, PatternError> {
   })
 }
 
-/// Match a token sequence against a word sequence. `...` and `-...` try
-/// every length they could take, shortest first, so a pattern may hold
-/// several of them.
-fn match_words(
+/// Match a token sequence against a word sequence, collecting every
+/// binding set that reaches the end. `...` and `-...` try every length
+/// they could take, shortest first, so a pattern may hold several of them.
+fn bind_words(
   tokens: &[Token],
   words: &[Word],
-) -> bool {
+  bound: Bindings,
+  out: &mut Vec<Bindings>,
+) {
   let Some((first, rest)) = tokens.split_first() else {
-    return words.is_empty();
+    if words.is_empty() {
+      push_unique(out, bound);
+    }
+    return;
   };
   match first {
-    Token::Rest => (0..=words.len()).any(|n| match_words(rest, &words[n..])),
+    Token::Rest => {
+      for n in 0..=words.len() {
+        bind_words(rest, &words[n..], bound.clone(), out);
+      }
+    }
     Token::Options => {
       let limit = words.iter().take_while(|w| is_option(w)).count();
-      (0..=limit).any(|n| match_words(rest, &words[n..]))
+      for n in 0..=limit {
+        bind_words(rest, &words[n..], bound.clone(), out);
+      }
     }
-    single => match words.split_first() {
-      Some((word, tail)) => single.matches_one(word) && match_words(rest, tail),
-      None => false,
-    },
+    single => {
+      if let Some((word, tail)) = words.split_first()
+        && let Some(next) = single.bind_one(word, &bound)
+      {
+        bind_words(rest, tail, next, out);
+      }
+    }
   }
 }
 
@@ -205,7 +282,29 @@ impl Token {
       (Token::Under(prefix), Word::Literal(found)) => {
         normalize_path(Path::new(found)).starts_with(prefix)
       }
+      (Token::Var(_), Word::Literal(_)) => true,
     }
+  }
+
+  /// [`Token::matches_one`] plus the capture: `bound` extended with this
+  /// word when the token is a binder, or unchanged. `None` when the word
+  /// does not match or a repeated binder disagrees with its first capture.
+  fn bind_one(
+    &self,
+    word: &Word,
+    bound: &Bindings,
+  ) -> Option<Bindings> {
+    if !self.matches_one(word) {
+      return None;
+    }
+    let mut next = bound.clone();
+    if let (Token::Var(name), Word::Literal(text)) = (self, word)
+      && let Some(earlier) = next.insert(name.clone(), text.clone())
+      && earlier != *text
+    {
+      return None;
+    }
+    Some(next)
   }
 }
 
@@ -219,16 +318,20 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 }
 
 impl RedirectPattern {
-  fn matches(
+  fn bind(
     &self,
     found: &Redirect,
-  ) -> bool {
+    bound: &Bindings,
+  ) -> Option<Bindings> {
     let kind_ok = match self.kind {
       RedirectKind::Write => matches!(found.kind, RedirectKind::Write | RedirectKind::Append),
       RedirectKind::Append => found.kind == RedirectKind::Append,
       RedirectKind::Read => found.kind == RedirectKind::Read,
     };
-    kind_ok && self.target.matches_one(&found.target)
+    if !kind_ok {
+      return None;
+    }
+    self.target.bind_one(&found.target, bound)
   }
 }
 
@@ -528,5 +631,86 @@ mod tests {
   fn a_pattern_with_only_redirects_needs_no_words() {
     assert!(matches("> /tmp/**", "> /tmp/out"));
     assert!(!matches("> /tmp/**", "echo hi > /tmp/out"));
+  }
+
+  // --- binders and bindings ---
+
+  fn var(name: &str) -> Token {
+    Token::Var(Var::from(name))
+  }
+
+  fn bound(pairs: &[(&str, &str)]) -> Bindings {
+    pairs
+      .iter()
+      .map(|(k, v)| (Var::from(*k), v.to_string()))
+      .collect()
+  }
+
+  fn from_tokens(
+    words: Vec<Token>,
+    redirects: Vec<RedirectPattern>,
+  ) -> Pattern {
+    Pattern::from_tokens("[test]".into(), words, redirects)
+  }
+
+  #[test]
+  fn from_tokens_shows_its_source_and_matches_like_parse() {
+    let p = from_tokens(
+      vec![lit("git"), Token::Options, lit("stash"), Token::Rest],
+      vec![],
+    );
+    assert_eq!(p.to_string(), "[test]");
+    assert!(p.matches(&command("git --no-pager stash pop")));
+    assert!(!p.matches(&command("git log")));
+  }
+
+  #[test]
+  fn a_binder_captures_one_literal_word() {
+    let p = from_tokens(vec![lit("cp"), Token::Rest, var("dst")], vec![]);
+    assert_eq!(
+      p.bindings(&command("cp -r a b")),
+      vec![bound(&[("dst", "b")])]
+    );
+    assert!(p.bindings(&command("cp")).is_empty());
+    assert!(p.bindings(&command("cp a $dst")).is_empty());
+  }
+
+  #[test]
+  fn a_pattern_without_binders_yields_one_empty_binding_set() {
+    let p = from_tokens(vec![lit("git"), Token::Rest, Token::Rest], vec![]);
+    assert_eq!(p.bindings(&command("git a b c")), vec![Bindings::new()]);
+  }
+
+  #[test]
+  fn every_way_to_match_yields_its_own_binding_set() {
+    let p = from_tokens(vec![lit("f"), Token::Rest, var("x"), Token::Rest], vec![]);
+    assert_eq!(
+      p.bindings(&command("f a b")),
+      vec![bound(&[("x", "a")]), bound(&[("x", "b")])]
+    );
+  }
+
+  #[test]
+  fn a_repeated_binder_must_capture_the_same_word() {
+    let p = from_tokens(vec![lit("cp"), var("x"), var("x")], vec![]);
+    assert_eq!(p.bindings(&command("cp a a")), vec![bound(&[("x", "a")])]);
+    assert!(p.bindings(&command("cp a b")).is_empty());
+  }
+
+  #[test]
+  fn a_redirect_target_can_bind() {
+    let p = from_tokens(
+      vec![Token::Rest],
+      vec![RedirectPattern {
+        kind: RedirectKind::Write,
+        target: var("out"),
+      }],
+    );
+    assert_eq!(
+      p.bindings(&command("echo hi > /tmp/x 2> err")),
+      vec![bound(&[("out", "/tmp/x")]), bound(&[("out", "err")])]
+    );
+    assert!(p.bindings(&command("echo hi > $out")).is_empty());
+    assert!(p.bindings(&command("echo hi")).is_empty());
   }
 }

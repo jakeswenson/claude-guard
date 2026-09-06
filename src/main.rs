@@ -14,6 +14,7 @@ mod repo;
 mod rules;
 mod segment;
 mod sexp;
+mod syntax;
 
 use std::io::{IsTerminal, Read};
 use std::panic::{self, AssertUnwindSafe};
