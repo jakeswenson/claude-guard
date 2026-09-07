@@ -1,6 +1,6 @@
 [package]
 name = "claude-guard"
-version = "0.1.0"
+version = "0.2.0-alpha"
 edition = "2024"
 description = "A Claude Code hook that denies tool calls that break house rules, says why, and logs every decision"
 repository = "https://github.com/jakeswenson/claude-guard"
