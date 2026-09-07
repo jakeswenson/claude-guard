@@ -1,79 +1,60 @@
 # Decision Log: claude-guard decision log
 
-Interview held 2026-09-04. Baseline principles were proposed by Claude before
-the interview; each is marked below as confirmed, amended, or still open.
+Held 2026-09-04. The baseline principles were proposed before the
+decisions below were made; each is marked at the end as confirmed,
+amended, or still open.
 
-## Problem (their words, refined as it sharpens)
+## Problem
 
-Every hook invocation writes one durable, typed record of what the guard saw
-and decided. The record is written by a dedicated trait and writer, never by
-tracing. Two readers: the escalation logic inside the hook, and a `review`
-web UI that searches across sessions and follows one session live. Success:
-from anywhere, in under a minute, Jake can see why a call was denied, passed,
-or asked, and can spot rules that should change.
+Every hook invocation writes one durable, typed record of what the guard
+saw and decided. The record is written by a dedicated trait and writer,
+never by tracing. Two readers: the escalation logic inside the hook, and a
+`review` web UI that searches across sessions and follows one session
+live. Success: from anywhere, in under a minute, the user can see why a
+call was denied, passed, or asked, and can spot rules that should change.
 
 ## Decisions
 
-- **D1** — The log is read through a third subcommand, `claude-guard review`,
-  runnable from any directory. Nobody opens the sessions directory by hand.
-  *(their words: "i'm not going to cd into a dir #1, but i want to run
-  `claude-guard review` from anywhere")*
+- **D1** — The log is read through a third subcommand, `claude-guard
+  review`, runnable from any directory. Nobody opens the sessions
+  directory by hand.
 - **D2** — `review` opens an embedded web UI rather than printing text: an
-  axum server with utoipa-described API and a SvelteKit or Astro SPA baked
-  into the binary. Two uses: search across session logs, and follow one
-  session as it runs. *(their words: "i think i'd rather have it popup an
-  integrated/embeded axum+utopia+sveltkit/astro SPA? and then i can search
-  session logs in the ui or follow a specific session")*
+  axum server with a utoipa-described API and a SvelteKit or Astro SPA
+  baked into the binary. Two uses: search across session logs, and follow
+  one session as it runs.
 - **D3** — The JSONL files stay the only source of truth. The hook never
-  talks to a running process; the UI tails or watches the files. *(their
-  words: "i'm ok with the ui just tailing/watching th jsonl")*
-- **D4** — Three kinds of navigation, not one search. Free text searches the
-  command and the repo/session space. Rule names are known facets, shown as
-  filters or buttons. Time is the axis of a timeline view over the event
-  stream, not a search term. *(their words: "command, repo/session space.
-  Rule names should be like know filters/buttons ... timeline is a vew not a
-  search really, its how you navigate the decision/event stream")*
+  talks to a running process; the UI tails or watches the files.
+- **D4** — Three kinds of navigation, not one search. Free text searches
+  the command and the repo/session space. Rule names are known facets,
+  shown as filters or buttons. Time is the axis of a timeline view over
+  the event stream, not a search term.
 - **D5** — Repo attribution uses the cwd Claude Code reports for the call,
   nothing more. A `cd` inside a command does not move the event. Deferred:
-  telling "commands run in a folder" apart from the session root. *(their
-  words: "for now, fine with it just being dotfiles sessions/cwd. but it
-  might be another thing in the future to allow understanding what commands
-  ran in a folder vs a sesion root")*
+  telling "commands run in a folder" apart from the session root.
 - **D6** — A manual decision from the dialog is stored with time decay. A
-  repeat right after the user's answer gets that answer applied (a user deny
-  becomes a deny, no dialog). As time passes and the session moves on, the
-  stored answer expires and the rule returns to deny-first, then ask.
-  *(their words: "after i do a manual decision, there should be a timedecay'd
-  storage of it. so if it asks again right away it gets a deny, but then if
-  time goes by and it might be doing much different things then it can fall
-  back to a deny-first+ ask possible thing")*
-  Depends on the guard learning what the user clicked; see Constraints.
+  repeat right after the user's answer gets that answer applied: a user
+  deny becomes a deny, with no dialog. As time passes and the session
+  moves on, the stored answer expires and the rule returns to deny-first,
+  then ask. Depends on the guard learning what the user clicked; see
+  Constraints.
 - **D7** — Passes are full records, same shape as denies. The UI folds them
-  by default so denies stand out, but they exist because passes and asks get
-  reviewed now and then to find rules that should change. Confirms A1.
-  *(their words: "folding is a thing. interesting part is to see denials for
-  sure and analyze them. but even pass/ask need to be reviewed for rules
-  updates time to time")*
+  by default so denies stand out, but they exist because passes and asks
+  get reviewed now and then to find rules that should change. Confirms A1.
 - **D8** — A deny record names the pattern row that fired, as pattern text,
   next to the rule name. Generic-row hits are the candidates for new rows.
-  *(their words: "yes")*
 - **D9** — A manual dialog answer applies for 5 minutes and never crosses a
   session boundary. Deferred: a per-project (cwd-keyed) memory that would
-  outlive the session. *(their words: "i think it doesn't cross ession
-  boundary... though maybe if we had CWD it could live for that project...
-  but i gues 5 mins is enoug decay?")*
+  outlive the session.
 - **D10** — Commands are logged verbatim, secrets included. Mitigation is
   retention, not redaction: session files older than a week are deleted.
-  Who deletes them is open. *(their words: "hmm... shit... maybe we should
-  clean old session after a ... week?")*
+  Who deletes them is open.
 
 ## Constraints Surfaced
 
-- Tracing never writes the log. *(their words: "we are not going to have
-  tracing write the log. for that we need a well defined trait + writer that
-  follows all the principles we align on before we start that phase")*
-- Everything typed. *(their words: "most important is that i want it all
-  proper typed")*
+- Tracing never writes the log. A well-defined trait and writer that
+  follow the principles below do, and that comes before any log code.
+- Everything typed. The record is one Rust type with serde on it, both
+  directions.
 - Spec: path `~/.local/state/claude-guard/sessions/<session_id>.jsonl`, exit
   code always 0, log failure goes to stderr and the decision still prints.
 - Claude Code hook events, checked against
@@ -115,7 +96,8 @@ or asked, and can spot rules that should change.
 
 ## Assumptions
 
-Baseline principles proposed by Claude, with their status after the interview:
+Baseline principles proposed before the decisions, with their status
+after them:
 
 - A1. One record per invocation, including passes. **Confirmed** by D7.
 - A2. The record stands alone: timestamp, session, tool use id, agent id,
