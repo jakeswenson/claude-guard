@@ -230,8 +230,12 @@ fn settled(
 /// What [`choose`] found among a pattern's binding sets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Choice {
-  /// A binding set under which the condition holds.
-  Holds(Bindings),
+  /// A binding set under which the condition holds, with the reasons
+  /// the facts gave, which the deny text carries as evidence (D10).
+  Holds {
+    bindings: Bindings,
+    evidence: Option<String>,
+  },
   /// No set holds, and this one came back unknown, with the reason. The
   /// engine turns this into an ask (D14).
   Unknown { bindings: Bindings, reason: String },
@@ -251,7 +255,10 @@ pub fn choose(
 ) -> Choice {
   let Some(cond) = cond else {
     return match candidates.into_iter().next() {
-      Some(bindings) => Choice::Holds(bindings),
+      Some(bindings) => Choice::Holds {
+        bindings,
+        evidence: None,
+      },
       None => Choice::NoMatch,
     };
   };
@@ -259,7 +266,12 @@ pub fn choose(
   for bindings in candidates {
     let answer = cond.eval(facts, call, &bindings);
     match answer.truth {
-      Truth::True => return Choice::Holds(bindings),
+      Truth::True => {
+        return Choice::Holds {
+          bindings,
+          evidence: answer.reason,
+        };
+      }
       Truth::Unknown if unknown.is_none() => {
         unknown = Some(Choice::Unknown {
           bindings,
@@ -369,9 +381,7 @@ mod tests {
     facts: &Facts,
     bindings: &Bindings,
   ) -> Answer {
-    let call = Call {
-      cwd: Path::new("/Users/x/proj"),
-    };
+    let call = Call::at(Path::new("/Users/x/proj"));
     parse(&sexp::read_one(source).unwrap(), &scope(&["p", "q"]), facts)
       .unwrap_or_else(|e| panic!("{source}: {e}"))
       .eval(facts, &call, bindings)
@@ -620,9 +630,7 @@ mod tests {
   #[test]
   fn choose_takes_the_first_binding_set_that_holds() {
     let facts = facts_with(&[], false);
-    let call = Call {
-      cwd: Path::new("/x"),
-    };
+    let call = Call::at(Path::new("/x"));
     let candidates = vec![
       bound(&[("p", "/var/a")]),
       bound(&[("p", "/tmp/a")]),
@@ -631,11 +639,17 @@ mod tests {
     let under_tmp = cond("(under? ?p \"/tmp\")");
     assert_eq!(
       choose(Some(&under_tmp), candidates.clone(), &facts, &call),
-      Choice::Holds(bound(&[("p", "/tmp/a")]))
+      Choice::Holds {
+        bindings: bound(&[("p", "/tmp/a")]),
+        evidence: None
+      }
     );
     assert_eq!(
       choose(None, candidates.clone(), &facts, &call),
-      Choice::Holds(bound(&[("p", "/var/a")]))
+      Choice::Holds {
+        bindings: bound(&[("p", "/var/a")]),
+        evidence: None
+      }
     );
     let under_etc = cond("(under? ?p \"/etc\")");
     assert_eq!(
@@ -649,9 +663,7 @@ mod tests {
   fn choose_reports_the_first_unknown_when_no_set_holds() {
     let mut facts = Facts::builtin();
     facts.declare("u?", Stub(Answer::unknown("timed out")));
-    let call = Call {
-      cwd: Path::new("/x"),
-    };
+    let call = Call::at(Path::new("/x"));
     let parse_with =
       |src: &str| parse(&sexp::read_one(src).unwrap(), &scope(&["p"]), &facts).unwrap();
     // Unknown alone.
@@ -682,7 +694,31 @@ mod tests {
     let candidates = vec![bound(&[("p", "/var/a")]), bound(&[("p", "/tmp/a")])];
     assert_eq!(
       choose(Some(&either), candidates, &facts, &call),
-      Choice::Holds(bound(&[("p", "/tmp/a")]))
+      Choice::Holds {
+        bindings: bound(&[("p", "/tmp/a")]),
+        evidence: None
+      }
+    );
+  }
+
+  #[test]
+  fn choose_carries_the_reasons_of_a_condition_that_held() {
+    let mut facts = Facts::builtin();
+    facts.declare("a?", Stub(Answer::holds().with_reason("a held")));
+    facts.declare("b?", Stub(Answer::holds().with_reason("b held")));
+    let call = Call::at(Path::new("/x"));
+    let both = parse(
+      &sexp::read_one("(and (a?) (b?))").unwrap(),
+      &scope(&[]),
+      &facts,
+    )
+    .unwrap();
+    assert_eq!(
+      choose(Some(&both), vec![Bindings::new()], &facts, &call),
+      Choice::Holds {
+        bindings: Bindings::new(),
+        evidence: Some("a held; b held".into())
+      }
     );
   }
 }

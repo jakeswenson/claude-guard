@@ -60,6 +60,7 @@ prints the rules in force. The guard exits 0 whatever happens, so a bug in it ne
 - Denies, asks, or warns on Bash commands and on the Write, Edit, MultiEdit, and Read tools, by rules in a file you own.
 - Sees through wrappers and script strings: sudo, env, nice, nohup, timeout, xargs, ssh, bash, sh, nu, python3.
 - Understands a program's options once declared, and generates declarations from [carapace](https://github.com/carapace-sh/carapace-bin) with `claude-guard commands add`.
+- Asks programs of yours for facts: `(fact in-git-worktree? (exec "git" "rev-parse" "--is-inside-work-tree") ...)` in the rule file, one JSON object in and one out. A fact that times out or fails turns a deny into an ask that says which fact could not be settled.
 - Logs one typed JSON record per hook call to `~/.local/state/claude-guard/sessions/<session>.jsonl`.
 - Ships an executable spec: every matcher and elaborator behavior is a `check` line under `spec/`, run by the tests.
 
@@ -67,7 +68,7 @@ prints the rules in force. The guard exits 0 whatever happens, so a bug in it ne
 
 - No review UI. The log is JSONL; `claude-guard commands` and `claude-guard elaborate --check-log` are the two readers so far.
 - No memory of your dialog answers, and no escalation from deny to ask on a repeat.
-- No facts beyond the filesystem near the working directory. Extern facts, session facts, and history facts are designed and not built.
+- No `claude-guard extern` subcommand yet to run a declared fact by hand, and no session-lifetime facts: every declared fact runs on every call that asks it. History facts and cwd tracking are designed and not built.
 - No pruning of old session files.
 
 The [design decision logs](docs/design/) say what is planned and why.

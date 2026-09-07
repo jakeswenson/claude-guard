@@ -684,9 +684,7 @@ fn check_cond(
 
   let scope = Scope::Row(bindings.keys().cloned().collect());
   let condition: Cond = cond::parse(subject, &scope, &facts)?;
-  let call = Call {
-    cwd: Path::new(&cwd),
-  };
+  let call = Call::at(Path::new(&cwd));
   let got = condition.eval(&facts, &call, &bindings);
   if got.truth != expected {
     return err(

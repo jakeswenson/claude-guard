@@ -92,7 +92,9 @@ pub enum Subject {
 }
 
 impl Subject {
-  fn of(ctx: &Context) -> Subject {
+  /// The subject of one call: what the rules looked at. Also the term an
+  /// `exec` fact reads on stdin, so the record and the program agree.
+  pub(crate) fn of(ctx: &Context) -> Subject {
     match (&ctx.input.tool, &ctx.seen) {
       (Tool::Bash { command }, Seen::Bash(Ok(segments))) => Subject::Bash {
         command: command.clone(),

@@ -8,25 +8,32 @@
 //! spec stands a stub under any name and the engine cannot tell.
 //!
 //! Built in: `ancestor-has?` and `under?`, one file each under `facts/`.
+//! `exec` is a fact a file declares, answered by a program over stdio.
 //! `stubs` holds the stand-ins the spec and the tests use, and the spec
-//! is not test-only code, so they are ordinary items. The extern runner
-//! (D9) will be one more type here. ADR 0003 has the reasons.
+//! is not test-only code, so they are ordinary items. ADR 0003 has the
+//! reasons.
 //!
-//! The registry is where memoization per call and the log's list of
-//! facts used will live; neither exists yet.
+//! The registry memoizes: one fact asked twice with the same arguments
+//! in the same cwd answers once, so a program declared as a fact runs at
+//! most once per hook call however many rows name it. The log's list of
+//! facts used will hang off the same place.
 
 mod ancestor_has;
+mod exec;
 mod stubs;
 mod under;
 
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub use ancestor_has::AncestorHas;
+pub use exec::Exec;
 pub use stubs::{Ancestors, Stub};
 pub use under::Under;
 
-use crate::input::string_id;
+use crate::input::{SessionId, ToolName, string_id};
 use crate::pattern::{Bindings, Var};
 use crate::sexp::Span;
 use crate::syntax::TypeError;
@@ -82,7 +89,7 @@ impl Answer {
   }
 
   /// Test-only until a fact in the binary attaches a reason to a settled
-  /// answer; the extern runner will.
+  /// answer other than by parsing it; `exec` reads its reason from JSON.
   #[cfg(test)]
   pub fn with_reason(
     mut self,
@@ -97,6 +104,14 @@ impl From<bool> for Answer {
   fn from(b: bool) -> Answer {
     if b { Answer::holds() } else { Answer::fails() }
   }
+}
+
+/// How long a fact's answer is good for. `fresh` is the only lifetime in
+/// this version: asked on every call. `session` and durations are D8's
+/// later work. No default (ADR 0002).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lifetime {
+  Fresh,
 }
 
 /// A fact's argument as written: a binder's capture or a literal.
@@ -119,10 +134,26 @@ impl Arg {
   }
 }
 
-/// What a fact may see besides its arguments. Grows with the facts: the
-/// extern runner adds the session, the tool, and the term.
+/// What a fact may see besides its arguments: the call's cwd, session,
+/// and tool, and the term, which is the log's subject for the call as
+/// JSON. An `exec` fact gets all of it on stdin.
 pub struct Call<'a> {
   pub cwd: &'a Path,
+  pub session_id: SessionId,
+  pub tool: ToolName,
+  pub term: serde_json::Value,
+}
+
+impl<'a> Call<'a> {
+  /// A call with no session behind it, for checks and tests.
+  pub fn at(cwd: &'a Path) -> Call<'a> {
+    Call {
+      cwd,
+      session_id: SessionId::from("none"),
+      tool: ToolName::from("none"),
+      term: serde_json::Value::Null,
+    }
+  }
 }
 
 /// One fact the language can name.
@@ -145,11 +176,26 @@ pub trait Fact {
   ) -> Answer;
 }
 
+/// What one answer was asked under: the fact, its arguments, and the
+/// cwd, which every built-in reads.
+type Asked = (FactName, Vec<String>, PathBuf);
+
 /// Every fact a file may name. Built-ins come first; a later declaration
 /// under the same name replaces the earlier one, which is how the spec
-/// and the tests stand in for the disk.
+/// and the tests stand in for the disk. Cloning gives a registry with
+/// the same facts and an empty memo.
 pub struct Facts {
-  by_name: BTreeMap<FactName, Box<dyn Fact>>,
+  by_name: BTreeMap<FactName, Arc<dyn Fact>>,
+  memo: RefCell<HashMap<Asked, Answer>>,
+}
+
+impl Clone for Facts {
+  fn clone(&self) -> Facts {
+    Facts {
+      by_name: self.by_name.clone(),
+      memo: RefCell::new(HashMap::new()),
+    }
+  }
 }
 
 impl Facts {
@@ -157,6 +203,7 @@ impl Facts {
   pub fn empty() -> Facts {
     Facts {
       by_name: BTreeMap::new(),
+      memo: RefCell::new(HashMap::new()),
     }
   }
 
@@ -174,7 +221,7 @@ impl Facts {
     name: impl Into<FactName>,
     fact: impl Fact + 'static,
   ) {
-    self.by_name.insert(name.into(), Box::new(fact));
+    self.by_name.insert(name.into(), Arc::new(fact));
   }
 
   pub fn get(
@@ -184,28 +231,38 @@ impl Facts {
     self.by_name.get(name).map(|fact| fact.as_ref())
   }
 
-  /// Ask a fact by name. An unknown answer is prefixed with the fact's
-  /// name, `in-jj-repo? is unknown: timed out`, so the evidence an ask
-  /// carries says which fact could not be settled. The parser refuses a
-  /// name the registry does not know, so that unknown is a guard, not a
-  /// path a loaded file takes.
+  /// Ask a fact by name, once per fact, arguments, and cwd. An unknown
+  /// answer is prefixed with the fact's name, `in-jj-repo? is unknown:
+  /// timed out`, so the evidence an ask carries says which fact could
+  /// not be settled. The parser refuses a name the registry does not
+  /// know, so that unknown is a guard, not a path a loaded file takes.
   pub fn ask(
     &self,
     name: &FactName,
     args: &[&str],
     call: &Call<'_>,
   ) -> Answer {
+    let key: Asked = (
+      name.clone(),
+      args.iter().map(|a| a.to_string()).collect(),
+      call.cwd.to_path_buf(),
+    );
+    if let Some(answer) = self.memo.borrow().get(&key) {
+      return answer.clone();
+    }
     let Some(fact) = self.get(name) else {
       return Answer::unknown(format!("no fact named `{name}`"));
     };
     let answer = fact.ask(args, call);
-    match answer.truth {
+    let answer = match answer.truth {
       Truth::Unknown => Answer::unknown(format!(
         "{name} is unknown: {}",
         answer.reason.as_deref().unwrap_or("no reason given")
       )),
       Truth::True | Truth::False => answer,
-    }
+    };
+    self.memo.borrow_mut().insert(key, answer.clone());
+    answer
   }
 }
 
@@ -221,6 +278,9 @@ pub(crate) fn err<T>(
 
 #[cfg(test)]
 mod tests {
+  use std::cell::Cell;
+  use std::rc::Rc;
+
   use super::*;
 
   fn at(
@@ -231,7 +291,7 @@ mod tests {
   }
 
   fn call<'a>(cwd: &'a Path) -> Call<'a> {
-    Call { cwd }
+    Call::at(cwd)
   }
 
   #[test]
@@ -271,6 +331,47 @@ mod tests {
       facts.ask(&FactName::from("yes?"), &[], &call(cwd)),
       Answer::holds().with_reason("as is")
     );
+  }
+
+  /// Counts how often it is asked.
+  struct Counting(Rc<Cell<u32>>);
+
+  impl Fact for Counting {
+    fn check(
+      &self,
+      _args: &[(Arg, Span)],
+      _span: Span,
+    ) -> Result<(), TypeError> {
+      Ok(())
+    }
+
+    fn ask(
+      &self,
+      _args: &[&str],
+      _call: &Call<'_>,
+    ) -> Answer {
+      self.0.set(self.0.get() + 1);
+      Answer::holds()
+    }
+  }
+
+  #[test]
+  fn an_answer_is_memoized_by_fact_arguments_and_cwd() {
+    let count = Rc::new(Cell::new(0));
+    let mut facts = Facts::builtin();
+    facts.declare("n?", Counting(count.clone()));
+    let name = FactName::from("n?");
+    let here = call(Path::new("/here"));
+    facts.ask(&name, &["a"], &here);
+    facts.ask(&name, &["a"], &here);
+    assert_eq!(count.get(), 1);
+    facts.ask(&name, &["b"], &here);
+    assert_eq!(count.get(), 2);
+    facts.ask(&name, &["a"], &call(Path::new("/there")));
+    assert_eq!(count.get(), 3);
+    // A clone starts with an empty memo and the same facts.
+    facts.clone().ask(&name, &["a"], &here);
+    assert_eq!(count.get(), 4);
   }
 
   #[test]

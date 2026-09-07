@@ -32,6 +32,30 @@
 (check (rule r :when (ancestor-has? ".jj") (deny [git ...] :reason "jj." :instead "jj."))
        passes "git log")
 
+;; --- a fact's reason is evidence, appended in parentheses (D10) ---
+
+;; When the condition held, the reasons the facts gave follow the row's
+;; text, so the model sees what the world said, not only what the rule
+;; said. A fact with no reason adds nothing; no reasons, no parentheses.
+(check (rule r (deny [git -... stash ...] :when (managed?) :reason "no stash." :instead "jj new."))
+       denies "git stash"
+       "claude-guard denied `git stash`: no stash. Instead: jj new. (jj root is /x)"
+       :facts ((managed? holds "jj root is /x")))
+(check (rule r (deny [git -... stash ...] :when (managed?) :reason "no stash." :instead "jj new."))
+       denies "git stash"
+       "claude-guard denied `git stash`: no stash. Instead: jj new."
+       :facts ((managed? holds)))
+(check (rule r (warn [cargo clean] :when (slow-disk?) :reason "slow."))
+       warns "cargo clean"
+       "claude-guard noted `cargo clean`: slow. (disk is 91% full)"
+       :facts ((slow-disk? holds "disk is 91% full")))
+
+;; The rule's `:when` reasons come first, then the row's, joined.
+(check (rule r :when (managed?) (deny [x] :when (and (a?) (b?)) :reason "r." :instead "i."))
+       denies "x"
+       "claude-guard denied `x`: r. Instead: i. (jj root is /x; a held; b held)"
+       :facts ((managed? holds "jj root is /x") (a? holds "a held") (b? holds "b held")))
+
 ;; --- unknown on a matched pattern asks (D14) ---
 
 ;; A deny or ask row whose pattern matched and whose condition is unknown

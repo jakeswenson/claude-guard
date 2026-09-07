@@ -20,10 +20,11 @@ use crate::elaborate::{Declarations, Elaborated, Inner};
 use crate::facts::{Call, Facts, Truth};
 use crate::input::{HookInput, Tool, string_id};
 use crate::load::{self, LoadError, Loaded, Source};
+use crate::log;
 use crate::output::Decision;
 use crate::pattern::{self, Bindings, Pattern};
 use crate::segment::{self, RedirectKind, SegmentError, Segments, Word};
-use crate::syntax::{FileTool, PathArg, Row, Rule, Subject};
+use crate::syntax::{FactDecl, FileTool, PathArg, Row, Rule, Subject};
 
 /// A row's decision kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,6 +123,10 @@ pub struct Verdict {
   /// Why the row's condition, or its rule's `:when`, could not be
   /// settled, when the decision is an ask for that reason (D14).
   pub unknown: Option<String>,
+  /// What the facts said when the condition held: the rule's `:when`
+  /// reasons, then the row's, joined (D10). Rendered in parentheses
+  /// after the row's text.
+  pub evidence: Option<String>,
 }
 
 /// A loaded rule table, ready to evaluate.
@@ -167,7 +172,7 @@ impl Ruleset {
     Ok(Ruleset::assemble(
       loaded.source,
       loaded.declarations,
-      facts,
+      registry(facts, &loaded.facts),
       loaded.file.rules,
     ))
   }
@@ -205,21 +210,30 @@ impl Ruleset {
           reason: format!("claude-guard could not parse this command: {e}"),
         },
         unknown: None,
+        evidence: None,
       });
     }
 
     let call = Call {
       cwd: ctx.input.cwd.as_ref(),
+      session_id: ctx.input.session_id.clone(),
+      tool: ctx.input.tool.name(),
+      term: serde_json::to_value(log::Subject::of(ctx)).unwrap_or(serde_json::Value::Null),
     };
     for rule in &self.rules {
-      let rule_unknown = match &rule.when {
-        None => None,
+      // The rule's `:when`: an unknown to carry to a matching row, or
+      // the reasons it held with.
+      let (rule_unknown, rule_evidence) = match &rule.when {
+        None => (None, None),
         Some(when) => {
           let answer = when.eval(&self.facts, &call, &Bindings::new());
           match answer.truth {
-            Truth::True => None,
+            Truth::True => (None, answer.reason),
             Truth::False => continue,
-            Truth::Unknown => Some(answer.reason.unwrap_or_else(|| "unknown".into())),
+            Truth::Unknown => (
+              Some(answer.reason.unwrap_or_else(|| "unknown".into())),
+              None,
+            ),
           }
         }
       };
@@ -232,12 +246,14 @@ impl Ruleset {
         if unknown.is_some() && row.decision == Kind::Warn {
           continue;
         }
+        let evidence = join_reasons([rule_evidence.clone(), found.evidence]);
         return Some(Verdict {
           rule: rule.name.clone(),
           pattern: Some(PatternText::from(row.subject.to_string())),
-          decision: render(row, &found.what, unknown.as_deref()),
+          decision: render(row, &found.what, unknown.as_deref(), evidence.as_deref()),
           bindings: found.bindings,
           unknown,
+          evidence,
         });
       }
     }
@@ -259,10 +275,21 @@ impl Ruleset {
           context: format!("claude-guard did not inspect: {list}"),
         },
         unknown: None,
+        evidence: None,
       });
     }
 
     None
+  }
+}
+
+/// The reasons present, joined with `; `; `None` when there are none.
+fn join_reasons(reasons: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+  let present: Vec<String> = reasons.into_iter().flatten().collect();
+  if present.is_empty() {
+    None
+  } else {
+    Some(present.join("; "))
   }
 }
 
@@ -271,10 +298,21 @@ impl From<Loaded> for Ruleset {
     Ruleset {
       source: loaded.source,
       declarations: loaded.declarations,
-      facts: Facts::builtin(),
+      facts: registry(Facts::builtin(), &loaded.facts),
       rules: loaded.file.rules,
     }
   }
+}
+
+/// `base` plus every declared fact, later declarations winning by name.
+fn registry(
+  mut base: Facts,
+  declared: &[FactDecl],
+) -> Facts {
+  for decl in declared {
+    base.declare(decl.name.clone(), decl.fact());
+  }
+  base
 }
 
 /// How far into wrappers and scripts a row looks: `ssh` carrying
@@ -282,12 +320,13 @@ impl From<Loaded> for Ruleset {
 const INNER_DEPTH: usize = 8;
 
 /// A row whose subject matched: the text of what matched, the bindings
-/// the condition was judged under, and the reason the condition came
-/// back unknown, when it did.
+/// the condition was judged under, and either the reason the condition
+/// came back unknown or the reasons it held with.
 struct Found {
   what: String,
   bindings: Bindings,
   unknown: Option<String>,
+  evidence: Option<String>,
 }
 
 impl Found {
@@ -296,15 +335,17 @@ impl Found {
     choice: Choice,
   ) -> Option<Found> {
     match choice {
-      Choice::Holds(bindings) => Some(Found {
+      Choice::Holds { bindings, evidence } => Some(Found {
         what: what(),
         bindings,
         unknown: None,
+        evidence,
       }),
       Choice::Unknown { bindings, reason } => Some(Found {
         what: what(),
         bindings,
         unknown: Some(reason),
+        evidence: None,
       }),
       Choice::NoMatch => None,
     }
@@ -379,33 +420,39 @@ fn find_in(
   }
 }
 
-/// The row's decision as text. With `unknown`, a deny or ask row renders
-/// as an ask and the evidence goes last in parentheses; the caller never
+/// The row's decision as text, with the facts' evidence, when there is
+/// any, last in parentheses. With `unknown`, a deny or ask row renders
+/// as an ask and the evidence is the unknown's reason; the caller never
 /// passes `unknown` for a warn row.
 fn render(
   row: &Row,
   what: &str,
   unknown: Option<&str>,
+  evidence: Option<&str>,
 ) -> Decision {
   let reason = &row.reason;
   let instead = match &row.instead {
     Some(instead) => format!(" Instead: {instead}"),
     None => String::new(),
   };
-  if let Some(evidence) = unknown {
+  let tail = match unknown.or(evidence) {
+    Some(text) => format!(" ({text})"),
+    None => String::new(),
+  };
+  if unknown.is_some() {
     return Decision::Ask {
-      reason: format!("claude-guard asks about `{what}`: {reason}{instead} ({evidence})"),
+      reason: format!("claude-guard asks about `{what}`: {reason}{instead}{tail}"),
     };
   }
   match row.decision {
     Kind::Deny => Decision::Deny {
-      reason: format!("claude-guard denied `{what}`: {reason}{instead}"),
+      reason: format!("claude-guard denied `{what}`: {reason}{instead}{tail}"),
     },
     Kind::Ask => Decision::Ask {
-      reason: format!("claude-guard asks about `{what}`: {reason}{instead}"),
+      reason: format!("claude-guard asks about `{what}`: {reason}{instead}{tail}"),
     },
     Kind::Warn => Decision::Warn {
-      context: format!("claude-guard noted `{what}`: {reason}{instead}"),
+      context: format!("claude-guard noted `{what}`: {reason}{instead}{tail}"),
     },
   }
 }
@@ -1128,6 +1175,82 @@ mod tests {
     // A false rule `:when` still skips the rule whole.
     let off = [("a?", Answer::fails()), ("b?", Answer::unknown("b out"))];
     assert_eq!(run_with_facts(text, bash("x"), &off), None);
+  }
+
+  #[test]
+  fn a_condition_that_held_puts_the_facts_reasons_in_parentheses() {
+    let stubs = [
+      ("managed?", Answer::holds().with_reason("jj root is /x")),
+      ("quiet?", Answer::holds()),
+      ("tidy?", Answer::holds().with_reason("no dirty files")),
+    ];
+    let text = "(rule r :when (managed?) (deny [git -... stash ...] :when (and (quiet?) (tidy?)) :reason \"no stash.\" :instead \"jj new.\"))";
+    let verdict = run_with_facts(text, bash("git stash"), &stubs).unwrap();
+    assert_eq!(
+      verdict.decision,
+      Decision::Deny {
+        reason: "claude-guard denied `git stash`: no stash. Instead: jj new. \
+                 (jj root is /x; no dirty files)"
+          .into()
+      }
+    );
+    assert_eq!(
+      verdict.evidence.as_deref(),
+      Some("jj root is /x; no dirty files")
+    );
+    assert_eq!(verdict.unknown, None);
+    // No reasons, no parentheses.
+    let text = "(rule r (warn [git -... stash ...] :when (quiet?) :reason \"hm.\"))";
+    let verdict = run_with_facts(text, bash("git stash"), &stubs).unwrap();
+    assert_eq!(
+      verdict.decision,
+      Decision::Warn {
+        context: "claude-guard noted `git stash`: hm.".into()
+      }
+    );
+    assert_eq!(verdict.evidence, None);
+  }
+
+  #[test]
+  fn a_declared_fact_runs_its_program_and_its_answer_decides() {
+    let dir = tempfile::tempdir().unwrap();
+    let text = r#"
+      (fact managed? (exec "sh" "-c" "echo '{\"holds\": true, \"reason\": \"the script said so\"}'")
+        :lifetime fresh :timeout "5s")
+      (fact slow? (exec "sh" "-c" "sleep 5") :lifetime fresh :timeout "100ms")
+      (fact arg? (exec "sh" "-c" "test \"$1\" = /tmp/x && echo '{\"holds\": true}' || echo '{\"holds\": false}'" "script")
+        :lifetime fresh :timeout "5s")
+      (rule r
+        (deny [git -... stash ...] :when (managed?) :reason "no stash." :instead "jj new.")
+        (deny [cargo clean] :when (slow?) :reason "slow." :instead "wait.")
+        (deny [cp ... ?dst] :when (arg? ?dst) :reason "no." :instead "elsewhere."))
+    "#;
+    let rules = Ruleset::from_text(text).unwrap_or_else(|e| panic!("{e}"));
+    let run = |command: &str| {
+      let mut input = input(bash(command));
+      input.cwd = dir.path().to_path_buf().into();
+      rules.evaluate(&Context::new(input, &rules.declarations))
+    };
+    assert_eq!(
+      run("git stash").unwrap().decision,
+      Decision::Deny {
+        reason: "claude-guard denied `git stash`: no stash. Instead: jj new. (the script said so)"
+          .into()
+      }
+    );
+    assert_eq!(
+      run("cargo clean").unwrap().decision,
+      Decision::Ask {
+        reason: "claude-guard asks about `cargo clean`: slow. Instead: wait. \
+                 (slow? is unknown: timed out after 100ms)"
+          .into()
+      }
+    );
+    assert!(matches!(
+      run("cp a /tmp/x").unwrap().decision,
+      Decision::Deny { .. }
+    ));
+    assert_eq!(run("cp a /var/x"), None);
   }
 
   #[test]

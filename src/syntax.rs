@@ -3,7 +3,7 @@
 //! The grammar this module accepts:
 //!
 //! ```text
-//! file    := (rule | command)*
+//! file    := (rule | command | fact)*
 //! rule    := (rule <name> [:when <cond>] row+)
 //! row     := (deny|ask|warn <subject> [:when <cond>] :reason "..." [:instead "..."])
 //! subject := [word*]                       ; a Bash command pattern
@@ -14,7 +14,13 @@
 //! decl    := (option "-c" ["--long"] [:value | :optional])*
 //!            (subcommand <name> [:alias <name>]* decl)*
 //!            [:inner (command [:from N]) | (script [:from N] [:when "-c"]) | (script :option "-c")]
+//! fact    := (fact <name>? (exec "program" "arg"*) :lifetime fresh :timeout "1s")
 //! ```
+//!
+//! Facts are read before rules, whatever the order in the file, so a
+//! rule may name a fact declared below it. A fact must be declared in
+//! the file whose rules name it, or be built in; `:lifetime` and
+//! `:timeout` have no defaults (ADR 0002).
 //!
 //! Pattern words map to the tokens in [`pattern`]: `*`, `...`, `-*`,
 //! `-...`, `?name`, and literals. A string in a bracket is a literal that
@@ -30,21 +36,45 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use crate::cond::{self, Cond, Scope};
 use crate::elaborate::{Arity, Declaration, InnerSpec, OptionSpec};
-use crate::facts::Facts;
+use crate::facts::{Exec, FactName, Facts, Lifetime};
 use crate::pattern::{Pattern, RedirectPattern, Token, Var};
 use crate::rules::{Kind, RuleName};
 use crate::segment::RedirectKind;
 use crate::sexp::{Kind as Sx, Node, Span};
 
-/// A whole rule file: rules in evaluation order, and the command
-/// declarations it carries.
+/// A whole rule file: rules in evaluation order, and the command and
+/// fact declarations it carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File {
   pub rules: Vec<Rule>,
   pub commands: Vec<CommandDecl>,
+  pub facts: Vec<FactDecl>,
+}
+
+/// One `(fact name (exec ...) ...)` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactDecl {
+  pub span: Span,
+  pub name: FactName,
+  pub program: String,
+  pub args: Vec<String>,
+  pub lifetime: Lifetime,
+  pub timeout: Duration,
+}
+
+impl FactDecl {
+  /// The fact this declaration registers.
+  pub fn fact(&self) -> Exec {
+    Exec {
+      program: self.program.clone(),
+      args: self.args.clone(),
+      timeout: self.timeout,
+    }
+  }
 }
 
 /// One `(command name ...)` form.
@@ -173,22 +203,46 @@ fn err<T>(
   })
 }
 
-const EXPECTED_FORM: &str = "expected (rule ...) or (command ...)";
+const EXPECTED_FORM: &str = "expected (rule ...), (command ...), or (fact ...)";
 
-/// Check every top-level form, naming only facts in `facts`. All the
-/// errors, or the table.
+/// Check every top-level form. Conditions may name the facts in `base`
+/// and the facts the file declares. All the errors, or the table.
 pub fn parse(
   forms: &[Node],
-  facts: &Facts,
+  base: &Facts,
 ) -> Result<File, Vec<TypeError>> {
   let mut file = File {
     rules: Vec::new(),
     commands: Vec::new(),
+    facts: Vec::new(),
   };
   let mut errors = Vec::new();
+
+  // Declared facts first, so a rule may name one declared anywhere in
+  // the file.
+  let mut facts = base.clone();
+  for form in forms.iter().filter(|f| head_symbol(f) == Some("fact")) {
+    match parse_fact(form) {
+      Ok(decl) if base.get(&decl.name).is_some() => errors.push(TypeError {
+        span: decl.span,
+        message: format!("`{}` is built in and cannot be redeclared", decl.name),
+      }),
+      Ok(decl) if file.facts.iter().any(|f| f.name == decl.name) => errors.push(TypeError {
+        span: decl.span,
+        message: format!("fact `{}` declared twice", decl.name),
+      }),
+      Ok(decl) => {
+        facts.declare(decl.name.clone(), decl.fact());
+        file.facts.push(decl);
+      }
+      Err(e) => errors.push(e),
+    }
+  }
+
   for form in forms {
     let result = match head_symbol(form) {
-      Some("rule") => parse_rule(form, facts).map(|rule| file.rules.push(rule)),
+      Some("fact") => continue,
+      Some("rule") => parse_rule(form, &facts).map(|rule| file.rules.push(rule)),
       Some("command") => parse_command(form).map(|decl| file.commands.push(decl)),
       Some(other) => err(
         form_head(form).span,
@@ -361,6 +415,141 @@ fn parse_row(
 // --- command declarations ---
 
 /// `(command name (option ...)* (subcommand ...)* [:inner ...])`.
+/// `(fact <name>? (exec "program" "arg"*) :lifetime fresh :timeout "1s")`.
+fn parse_fact(form: &Node) -> Result<FactDecl, TypeError> {
+  let Sx::List(items) = &form.kind else {
+    return err(form.span, EXPECTED_FORM);
+  };
+  let [_head, name_node, rest @ ..] = items.as_slice() else {
+    return err(form.span, "fact needs a name");
+  };
+  let name = match &name_node.kind {
+    Sx::Symbol(name) if name.ends_with('?') && name.len() > 1 => name,
+    _ => {
+      return err(
+        name_node.span,
+        "fact name must be a symbol ending in `?`, such as `in-jj-repo?`",
+      );
+    }
+  };
+  let Some((body, keywords)) = rest.split_first() else {
+    return err(
+      form.span,
+      format!("(fact {name} ...) needs an (exec \"program\" \"arg\"...) body"),
+    );
+  };
+  let (program, args) = parse_exec(body)?;
+
+  let mut lifetime = None;
+  let mut timeout = None;
+  let mut i = 0;
+  while i < keywords.len() {
+    let item = &keywords[i];
+    let Sx::Keyword(key) = &item.kind else {
+      return err(item.span, format!("unexpected `{item}` after (exec ...)"));
+    };
+    let Some(value) = keywords.get(i + 1) else {
+      return err(item.span, format!("`:{key}` needs a value"));
+    };
+    match key.as_str() {
+      "lifetime" => {
+        let parsed = match &value.kind {
+          Sx::Symbol(s) if s == "fresh" => Lifetime::Fresh,
+          Sx::Symbol(other) => {
+            return err(
+              value.span,
+              format!("`:lifetime` is `fresh` in this version, not `{other}`"),
+            );
+          }
+          _ => return err(value.span, "`:lifetime` takes a symbol: fresh"),
+        };
+        set_once(&mut lifetime, item, parsed)?;
+      }
+      "timeout" => {
+        let Sx::Str(text) = &value.kind else {
+          return err(
+            value.span,
+            "`:timeout` takes a duration string such as \"1s\" or \"500ms\"",
+          );
+        };
+        set_once(&mut timeout, item, parse_duration(value, text)?)?;
+      }
+      other => return err(item.span, format!("unknown keyword `:{other}` in fact")),
+    }
+    i += 2;
+  }
+  let Some(lifetime) = lifetime else {
+    return err(
+      form.span,
+      format!("(fact {name} ...) needs :lifetime; there is no default"),
+    );
+  };
+  let Some(timeout) = timeout else {
+    return err(
+      form.span,
+      format!("(fact {name} ...) needs :timeout; there is no default"),
+    );
+  };
+  Ok(FactDecl {
+    span: form.span,
+    name: FactName::from(name.as_str()),
+    program,
+    args,
+    lifetime,
+    timeout,
+  })
+}
+
+/// `(exec "program" "arg"*)`: the program and its leading arguments.
+fn parse_exec(node: &Node) -> Result<(String, Vec<String>), TypeError> {
+  const EXPECTED: &str = "expected (exec \"program\" \"arg\"...)";
+  let Sx::List(items) = &node.kind else {
+    return err(node.span, EXPECTED);
+  };
+  let Some((head, words)) = items.split_first() else {
+    return err(node.span, EXPECTED);
+  };
+  match &head.kind {
+    Sx::Symbol(s) if s == "exec" => {}
+    Sx::Symbol(other) => return err(head.span, format!("{EXPECTED}, found `{other}`")),
+    _ => return err(head.span, EXPECTED),
+  }
+  let Some((program, args)) = words.split_first() else {
+    return err(node.span, "`exec` needs a program");
+  };
+  let text = |node: &Node| match &node.kind {
+    Sx::Str(s) => Ok(s.clone()),
+    _ => err(
+      node.span,
+      "`exec` takes its program and arguments as strings",
+    ),
+  };
+  Ok((
+    text(program)?,
+    args.iter().map(text).collect::<Result<Vec<_>, _>>()?,
+  ))
+}
+
+/// A duration as a rule file writes it: `"1s"`, `"500ms"`, `"1.5s"`.
+/// Must be more than zero.
+fn parse_duration(
+  node: &Node,
+  text: &str,
+) -> Result<Duration, TypeError> {
+  let signed: jiff::SignedDuration = text.parse().map_err(|e| TypeError {
+    span: node.span,
+    message: format!("`:timeout` is not a duration such as \"1s\" or \"500ms\": {e}"),
+  })?;
+  let duration: Duration = signed.try_into().map_err(|_| TypeError {
+    span: node.span,
+    message: "`:timeout` must be more than zero".into(),
+  })?;
+  if duration.is_zero() {
+    return err(node.span, "`:timeout` must be more than zero");
+  }
+  Ok(duration)
+}
+
 fn parse_command(form: &Node) -> Result<CommandDecl, TypeError> {
   let Sx::List(items) = &form.kind else {
     return err(form.span, EXPECTED_FORM);
@@ -1023,9 +1212,175 @@ mod tests {
 
   // --- errors: file and rule shape ---
 
+  // --- fact declarations ---
+
   #[test]
-  fn a_top_level_form_must_be_a_rule_or_a_command() {
-    let expected = "expected (rule ...) or (command ...)";
+  fn a_fact_declaration_parses_and_registers_its_name() {
+    let parsed = file(
+      "(rule r (deny [git stash] :when (managed?) :reason \"r.\" :instead \"i.\"))\n\
+       (fact managed? (exec \"sh\" \"-c\" \"echo yes\") :lifetime fresh :timeout \"1s\")",
+    );
+    assert_eq!(parsed.facts.len(), 1);
+    let decl = &parsed.facts[0];
+    assert_eq!(decl.span, Span { line: 2, col: 1 });
+    assert_eq!(decl.name, FactName::from("managed?"));
+    assert_eq!(decl.program, "sh");
+    assert_eq!(decl.args, vec!["-c", "echo yes"]);
+    assert_eq!(decl.lifetime, Lifetime::Fresh);
+    assert_eq!(decl.timeout, Duration::from_secs(1));
+    // The rule above the declaration named it.
+    assert_eq!(
+      parsed.rules[0].rows[0].when,
+      Some(Cond::Fact {
+        name: "managed?".into(),
+        args: vec![],
+      })
+    );
+    // Arguments at the call site are strings or in-scope binders.
+    file(
+      "(fact f? (exec \"p\") :lifetime fresh :timeout \"500ms\")\n\
+       (rule r (deny [cp ?a ?b] :when (f? \"x\" ?a ?b) :reason \"r.\" :instead \"i.\"))",
+    );
+    assert_eq!(
+      error(
+        "(fact f? (exec \"p\") :lifetime fresh :timeout \"1s\")\n\
+         (rule r (deny [cp ?a] :when (f? ?z) :reason \"r.\" :instead \"i.\"))"
+      ),
+      "2:33: `?z` is not bound by this pattern"
+    );
+  }
+
+  #[test]
+  fn a_fact_declaration_is_checked_part_by_part() {
+    let ok = "(exec \"p\") :lifetime fresh :timeout \"1s\"";
+    assert_eq!(error("(fact)"), "1:1: fact needs a name");
+    assert_eq!(
+      error(&format!("(fact managed {ok})")),
+      "1:7: fact name must be a symbol ending in `?`, such as `in-jj-repo?`"
+    );
+    assert_eq!(
+      error(&format!("(fact \"m?\" {ok})")),
+      "1:7: fact name must be a symbol ending in `?`, such as `in-jj-repo?`"
+    );
+    assert_eq!(
+      error(&format!("(fact ? {ok})")),
+      "1:7: fact name must be a symbol ending in `?`, such as `in-jj-repo?`"
+    );
+    assert_eq!(
+      error("(fact m?)"),
+      "1:1: (fact m? ...) needs an (exec \"program\" \"arg\"...) body"
+    );
+    assert_eq!(
+      error("(fact m? \"p\" :lifetime fresh :timeout \"1s\")"),
+      "1:10: expected (exec \"program\" \"arg\"...)"
+    );
+    assert_eq!(
+      error("(fact m? (run \"p\") :lifetime fresh :timeout \"1s\")"),
+      "1:11: expected (exec \"program\" \"arg\"...), found `run`"
+    );
+    assert_eq!(
+      error("(fact m? (exec) :lifetime fresh :timeout \"1s\")"),
+      "1:10: `exec` needs a program"
+    );
+    assert_eq!(
+      error("(fact m? (exec sh) :lifetime fresh :timeout \"1s\")"),
+      "1:16: `exec` takes its program and arguments as strings"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"sh\" -c) :lifetime fresh :timeout \"1s\")"),
+      "1:21: `exec` takes its program and arguments as strings"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :timeout \"1s\")"),
+      "1:1: (fact m? ...) needs :lifetime; there is no default"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh)"),
+      "1:1: (fact m? ...) needs :timeout; there is no default"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime session :timeout \"1s\")"),
+      "1:31: `:lifetime` is `fresh` in this version, not `session`"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime \"fresh\" :timeout \"1s\")"),
+      "1:31: `:lifetime` takes a symbol: fresh"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :lifetime fresh :timeout \"1s\")"),
+      "1:37: `:lifetime` given twice"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :timeout 1)"),
+      "1:46: `:timeout` takes a duration string such as \"1s\" or \"500ms\""
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :timeout \"soon\")"),
+      "1:46: `:timeout` is not a duration such as \"1s\" or \"500ms\": failed to parse input in the \"friendly\" duration format: expected duration to start with a unit value (a decimal integer) after an optional sign, but no integer was found"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :timeout \"0s\")"),
+      "1:46: `:timeout` must be more than zero"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :timeout \"-1s\")"),
+      "1:46: `:timeout` must be more than zero"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :timeout)"),
+      "1:37: `:timeout` needs a value"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") :lifetime fresh :timeout \"1s\" :memo yes)"),
+      "1:51: unknown keyword `:memo` in fact"
+    );
+    assert_eq!(
+      error("(fact m? (exec \"p\") fresh :timeout \"1s\")"),
+      "1:21: unexpected `fresh` after (exec ...)"
+    );
+    // Durations in the friendly format.
+    let decl = |t: &str| {
+      file(&format!(
+        "(fact m? (exec \"p\") :lifetime fresh :timeout \"{t}\")"
+      ))
+      .facts[0]
+        .timeout
+    };
+    assert_eq!(decl("500ms"), Duration::from_millis(500));
+    assert_eq!(decl("1.5s"), Duration::from_millis(1500));
+    assert_eq!(decl("2m"), Duration::from_secs(120));
+  }
+
+  #[test]
+  fn a_fact_is_declared_once_and_never_over_a_builtin() {
+    assert_eq!(
+      error(
+        "(fact m? (exec \"p\") :lifetime fresh :timeout \"1s\")\n\
+         (fact m? (exec \"q\") :lifetime fresh :timeout \"1s\")"
+      ),
+      "2:1: fact `m?` declared twice"
+    );
+    assert_eq!(
+      error("(fact ancestor-has? (exec \"p\") :lifetime fresh :timeout \"1s\")"),
+      "1:1: `ancestor-has?` is built in and cannot be redeclared"
+    );
+    // A bad declaration and a rule naming it are two errors, and the
+    // rule's is the useful one: the name never registered.
+    assert_eq!(
+      errors(
+        "(fact m? (exec \"p\") :lifetime fresh)\n\
+         (rule r (deny [x] :when (m?) :reason \"r.\" :instead \"i.\"))"
+      ),
+      [
+        "1:1: (fact m? ...) needs :timeout; there is no default",
+        "2:26: unknown fact `m?`"
+      ]
+    );
+  }
+
+  #[test]
+  fn a_top_level_form_must_be_a_rule_a_command_or_a_fact() {
+    let expected = "expected (rule ...), (command ...), or (fact ...)";
     assert_eq!(error("[git stash]"), format!("1:1: {expected}"));
     assert_eq!(error("()"), format!("1:1: {expected}"));
     assert_eq!(

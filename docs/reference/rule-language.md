@@ -4,7 +4,7 @@ The complete grammar and its meaning. A rule's behavior is decidable from this p
 
 ## Files
 
-A file is a sequence of top-level forms, each a `(rule ...)` or a `(command ...)`. Comments run from `;` to the end of the line. The reader knows five node kinds: lists in parentheses, patterns in square brackets, strings in double quotes with `\"`, `\\`, `\n`, and `\t` escapes, keywords starting with `:`, and symbols, which are any other run of characters up to whitespace or one of `()[]";`. There are no numbers.
+A file is a sequence of top-level forms, each a `(rule ...)`, a `(command ...)`, or a `(fact ...)`. Comments run from `;` to the end of the line. The reader knows five node kinds: lists in parentheses, patterns in square brackets, strings in double quotes with `\"`, `\\`, `\n`, and `\t` escapes, keywords starting with `:`, and symbols, which are any other run of characters up to whitespace or one of `()[]";`. There are no numbers.
 
 Which files load, and in what order, is in [the command line](command-line.md#files).
 
@@ -62,14 +62,18 @@ cond := (<fact> arg*)
 arg  := ?name | "text"
 ```
 
-A fact is a proposition about the call: named in a condition with its arguments, it holds, fails, or is unknown. The name ends in `?`. Naming a fact the guard does not know is a load error, and each fact checks its own arguments at load time.
+A fact is a proposition about the call: named in a condition with its arguments, it holds, fails, or is unknown. The name ends in `?`. Naming a fact the guard does not know is a load error, and each fact checks its own arguments at load time. A fact is built in or [declared](#fact-declarations) in the same file.
 
-Two facts exist:
+Two facts are built in:
 
 | Fact | Holds when |
 |---|---|
 | `(ancestor-has? "name")` | the call's working directory or any directory above it contains an entry named `name` |
 | `(under? <arg> "prefix")` | the path, resolved against the working directory if relative and with `/private` stripped, is the prefix or below it by path component |
+
+A declared fact takes any number of arguments, each a string or a binder in scope, and passes them to its program.
+
+A fact is asked at most once per call for the same arguments in the same working directory, however many rows name it.
 
 Conditions are three-valued: true, false, unknown. `and`, `or`, and `not` follow Kleene's tables: one false settles an `and`, one true settles an `or`, `not` swaps true and false, and everything else that touches an unknown is unknown. No shipped fact produces unknown in this version; a fact that asks a program will. What an unknown does to a rule is under [Evaluation](#evaluation).
 
@@ -89,7 +93,32 @@ For one tool call:
 
 A command pattern is tried against every simple command of the call, and then against what each carries: an inner command as is, an inner script segmented first, to a depth of eight. The outermost match wins. What was matched is what the deny text names.
 
-The rendered text is `claude-guard denied `<what>`: <reason> Instead: <instead>` for deny, `claude-guard asks about ...` for ask, and `claude-guard noted ...` for warn, with the `Instead:` clause absent when the row has none. An ask caused by an unknown ends with the evidence in parentheses: `claude-guard asks about `git stash`: <reason> Instead: <instead> (in-jj-repo? is unknown: timed out after 1s)`. The evidence names the fact and gives the fact's own reason.
+The rendered text is `claude-guard denied `<what>`: <reason> Instead: <instead>` for deny, `claude-guard asks about ...` for ask, and `claude-guard noted ...` for warn, with the `Instead:` clause absent when the row has none. When the facts gave reasons, they follow in parentheses, the rule's `:when` reasons first and then the row's, joined with `; `: `claude-guard denied `git stash`: <reason> Instead: <instead> (jj root is /x)`. An ask caused by an unknown ends the same way with the unknown's reason, which names the fact: `(in-jj-repo? is unknown: timed out after 1s)`. The rule owns the reason and the instead; a fact's reason is evidence, never a verdict.
+
+## Fact declarations
+
+```
+fact := (fact <name> (exec "program" "arg"*) :lifetime fresh :timeout "1s")
+```
+
+`<name>` is a symbol ending in `?`. The declaration may sit anywhere in the file; facts are read before rules. A name declared twice, or one that is built in, is a load error. Both keywords are required and have no default. `:lifetime` accepts `fresh`: the fact is asked on every call. `:timeout` is a duration string such as `"1s"`, `"500ms"`, or `"1.5s"`, more than zero.
+
+When asked, the guard runs the program with:
+
+- argv: the declared arguments, then the condition's arguments in order;
+- the environment: `CLAUDE_GUARD_CWD`, `CLAUDE_GUARD_SESSION_ID`, `CLAUDE_GUARD_TOOL`, and `CLAUDE_GUARD_PROTOCOL=1`, added to the hook's own;
+- the working directory: the call's `cwd`;
+- stdin: one JSON object, closed after it is written:
+
+```json
+{"protocol": 1, "cwd": "/Users/x/proj", "session_id": "abc123", "tool": "Bash",
+ "subject": {"bash": {"command": "git stash", "commands": [...], "elaborated": [...], "uninspected": [], "parse_error": null}},
+ "args": ["/tmp/x"]}
+```
+
+`subject` is the same value the log record carries for the call, keyed by tool; [the log format](log-format.md) lists its shapes. The program answers with one JSON object on stdout, `{"holds": true}` or `{"holds": false}`, with an optional `"reason"` string that becomes evidence. Fields it does not know are ignored. Stderr passes through to the hook's stderr.
+
+The answer is unknown, with a reason, when the program cannot be started, exits non-zero, runs past `:timeout`, or prints anything but that object. The program runs in its own process group, and a timeout kills the whole group, so a script's children do not outlive the timeout. An unknown reads `<name> is unknown: <reason>` wherever it appears.
 
 ## Command declarations
 

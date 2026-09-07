@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "development-tools"]
 brush-parser = "0.4.0"
 color-eyre = "0.6.5"
 jiff = { version = "0.2.35", features = ["serde"] }
+libc = "0.2.189"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_repr = "0.1.21"

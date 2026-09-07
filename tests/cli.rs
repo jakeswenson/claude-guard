@@ -219,6 +219,80 @@ fn a_user_rule_file_replaces_the_builtin_rules() {
     .stdout("");
 }
 
+/// A PreToolUse payload whose cwd is a real directory, so a declared
+/// fact's program can start there.
+fn bash_call_in(
+  cwd: &Path,
+  command: &str,
+) -> String {
+  bash_call(command).replace("/Users/x/code/proj", &cwd.display().to_string())
+}
+
+#[test]
+fn a_declared_fact_runs_a_program_whose_answer_decides() {
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  fs::write(
+    &rules,
+    r#"
+      (fact managed? (exec "sh" "-c" "test \"$CLAUDE_GUARD_PROTOCOL\" = 1 && echo '{\"holds\": true, \"reason\": \"the script said so\"}'")
+        :lifetime fresh :timeout "5s")
+      (fact slow? (exec "sh" "-c" "sleep 5") :lifetime fresh :timeout "200ms")
+      (rule r
+        (deny [git -... stash ...] :when (managed?) :reason "no stash." :instead "jj new.")
+        (deny [cargo clean] :when (slow?) :reason "slow." :instead "wait."))
+    "#,
+  )
+  .unwrap();
+
+  let mut command = guard_logging_to(state.path());
+  command.env("CLAUDE_GUARD_RULES", &rules);
+  command
+    .arg("hook")
+    .write_stdin(bash_call_in(state.path(), "git stash"))
+    .assert()
+    .code(0)
+    .stdout(predicate::str::contains(
+      "claude-guard denied `git stash`: no stash. Instead: jj new. (the script said so)",
+    ));
+
+  let mut command = guard_logging_to(state.path());
+  command.env("CLAUDE_GUARD_RULES", &rules);
+  command
+    .arg("hook")
+    .write_stdin(bash_call_in(state.path(), "cargo clean"))
+    .assert()
+    .code(0)
+    .stdout(predicate::str::contains(
+      "claude-guard asks about `cargo clean`: slow. Instead: wait. (slow? is unknown: timed out after 200ms)",
+    ));
+}
+
+#[test]
+fn a_fact_declaration_that_does_not_load_fails_open_with_its_position() {
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  fs::write(
+    &rules,
+    "(fact managed? (exec \"true\") :lifetime fresh)\n(rule r (deny [x] :when (managed?) :reason \"r.\" :instead \"i.\"))",
+  )
+  .unwrap();
+  let mut command = guard_logging_to(state.path());
+  command.env("CLAUDE_GUARD_RULES", &rules);
+  command
+    .arg("hook")
+    .write_stdin(bash_call("x"))
+    .assert()
+    .code(0)
+    .stdout("")
+    .stderr(predicate::str::contains(
+      "rules.scm:1:1: (fact managed? ...) needs :timeout; there is no default",
+    ))
+    .stderr(predicate::str::contains(
+      "rules.scm:2:26: unknown fact `managed?`",
+    ));
+}
+
 #[test]
 fn a_broken_rule_file_fails_open_and_still_leaves_a_record() {
   let state = state_dir();

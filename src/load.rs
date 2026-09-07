@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 use crate::elaborate::Declarations;
 use crate::sexp::{self, ReadError};
-use crate::syntax::{self, File, TypeError};
+use crate::syntax::{self, FactDecl, File, TypeError};
 
 /// The rules path override.
 pub const RULES_ENV: &str = "CLAUDE_GUARD_RULES";
@@ -70,13 +70,15 @@ impl fmt::Display for Source {
   }
 }
 
-/// Everything in force: the rules, where they came from, and the merged
-/// command declarations.
+/// Everything in force: the rules, where they came from, the merged
+/// command declarations, and every fact declared in any loaded file, in
+/// load order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Loaded {
   pub source: Source,
   pub file: File,
   pub declarations: Declarations,
+  pub facts: Vec<FactDecl>,
 }
 
 /// One thing wrong with a source.
@@ -221,8 +223,9 @@ fn load(
 
   // Built-in declarations first, so everything later wins over them.
   let mut declarations = Declarations::new();
+  let mut facts = Vec::new();
   match parse_text(Source::BuiltinCommands, BUILTIN_COMMANDS) {
-    Ok(file) => declare_all(&mut declarations, &file),
+    Ok(file) => declare_all(&mut declarations, &mut facts, &file),
     Err(e) => problems.extend(e.problems),
   }
 
@@ -241,13 +244,13 @@ fn load(
     }
   };
   if let Some((_, file)) = &rules {
-    declare_all(&mut declarations, file);
+    declare_all(&mut declarations, &mut facts, file);
   }
 
   if let Some(dir) = commands_dir {
     for path in scm_files(&dir) {
       match read(Source::File(path)) {
-        Ok((_, file)) => declare_all(&mut declarations, &file),
+        Ok((_, file)) => declare_all(&mut declarations, &mut facts, &file),
         Err(e) => problems.extend(e.problems),
       }
     }
@@ -258,18 +261,22 @@ fn load(
       source,
       file,
       declarations,
+      facts,
     }),
     _ => Err(LoadError { problems }),
   }
 }
 
+/// Take a file's command and fact declarations into the running totals.
 fn declare_all(
   declarations: &mut Declarations,
+  facts: &mut Vec<FactDecl>,
   file: &File,
 ) {
   for command in &file.commands {
     declarations.declare(&command.name, command.declaration.clone());
   }
+  facts.extend(file.facts.iter().cloned());
 }
 
 /// The `.scm` files directly under `dir`, in name order. A directory
@@ -344,14 +351,16 @@ pub fn load_text_with(
   facts: &crate::facts::Facts,
 ) -> Result<Loaded, LoadError> {
   let mut declarations = Declarations::new();
+  let mut declared = Vec::new();
   let builtin = parse_text_with(Source::BuiltinCommands, BUILTIN_COMMANDS, facts)?;
-  declare_all(&mut declarations, &builtin);
+  declare_all(&mut declarations, &mut declared, &builtin);
   let file = parse_text_with(source.clone(), text, facts)?;
-  declare_all(&mut declarations, &file);
+  declare_all(&mut declarations, &mut declared, &file);
   Ok(Loaded {
     source,
     file,
     declarations,
+    facts: declared,
   })
 }
 

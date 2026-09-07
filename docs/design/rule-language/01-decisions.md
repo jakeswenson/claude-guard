@@ -202,6 +202,22 @@ arguments.
   ["text"] ...)`, that runs one rule through the engine, so D14 and ADR
   0001 have check lines in `spec/evaluation.scm`. Made while
   implementing D14, 2026-09-07.
+- **D30** — The `fact` form and the stdio protocol as built. `(fact
+  name? (exec "program" "arg"...) :lifetime fresh :timeout "1s")`, facts
+  read before rules so order in the file is free, a fact declared in the
+  file whose rules name it, declared twice or over a built-in a load
+  error. Stdin is `{"protocol": 1, "cwd", "session_id", "tool",
+  "subject", "args"}`, with `subject` the log record's subject so the
+  record and the program see one term; bindings are not sent, since the
+  rule passes what it wants as arguments. Stdout fields the guard does
+  not know are ignored. The registry memoizes by fact, arguments, and
+  cwd, so a program runs at most once per call. A settled answer's
+  reasons follow the row's text in parentheses, the rule's `:when` first
+  and then the row's, which is D10 as built. The program leads its own
+  process group and a timeout kills the group: found when a timed-out
+  `sh -c` left its `sleep` holding the hook's stderr, which would keep
+  Claude Code waiting past the timeout the rule promised. Made while
+  implementing D9, 2026-09-07.
 
 ## Scope: first version
 
