@@ -335,6 +335,7 @@ fn pre_tool_use(raw: &str) -> Result<()> {
   record(log::Record::pre_tool_use(
     &ctx,
     verdict.as_ref(),
+    rules.facts_asked(),
     jiff::Timestamp::now(),
   ));
 

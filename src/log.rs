@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_repr::{Deserialize_repr, Serialize_repr};
 
 use crate::elaborate::Elaborated;
+use crate::facts::Asked;
 use crate::input::{
   AgentId, Envelope, Event, McpServer, McpTool, SessionId, Tool, ToolName, ToolUseId, WorkingDir,
   string_id,
@@ -170,14 +171,21 @@ pub struct Record {
   /// on lines written before it existed.
   #[serde(default)]
   pub bindings: Option<Bindings>,
+  /// Every fact the evaluation asked, in order, with its answer and how
+  /// long it took; empty when no condition ran. `null` on events the
+  /// guard only observed. Absent on lines written before it existed.
+  #[serde(default)]
+  pub facts: Option<Vec<Asked>>,
   pub reason: Option<Reason>,
 }
 
 impl Record {
-  /// The record for one PreToolUse call. `None` for the verdict is a pass.
+  /// The record for one PreToolUse call. `None` for the verdict is a
+  /// pass; `facts` is what the evaluation asked.
   pub fn pre_tool_use(
     ctx: &Context,
     verdict: Option<&Verdict>,
+    facts: Vec<Asked>,
     ts: Timestamp,
   ) -> Record {
     let input = &ctx.input;
@@ -204,6 +212,7 @@ impl Record {
       bindings: verdict
         .filter(|v| v.pattern.is_some())
         .map(|v| v.bindings.clone()),
+      facts: Some(facts),
       reason,
     }
   }
@@ -229,6 +238,7 @@ impl Record {
       rule: None,
       pattern: None,
       bindings: None,
+      facts: None,
       reason: None,
     }
   }
@@ -462,6 +472,7 @@ impl Reader for Memory {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::facts::{FactName, Truth};
   use crate::input::HookInput;
   use crate::rules::Ruleset;
   use crate::rules::testing::builtin_in_repo;
@@ -497,8 +508,14 @@ mod tests {
     tool: Tool,
   ) -> Record {
     let ctx = context(session, tool);
-    let verdict = builtin_in_repo(false).evaluate(&ctx);
-    Record::pre_tool_use(&ctx, verdict.as_ref(), at("2026-09-05T10:00:00Z"))
+    let rules = builtin_in_repo(false);
+    let verdict = rules.evaluate(&ctx);
+    Record::pre_tool_use(
+      &ctx,
+      verdict.as_ref(),
+      rules.facts_asked(),
+      at("2026-09-05T10:00:00Z"),
+    )
   }
 
   // --- the record ---
@@ -516,7 +533,7 @@ mod tests {
         r#""elaborated":[{"parts":[{"name":{"literal":"git"}},{"arg":{"literal":"checkout"}},{"arg":{"literal":"main"}}],"#,
         r#""declared":false,"subcommand":[],"inner":null,"redirects":[]}],"#,
         r#""uninspected":[],"parse_error":null}},"#,
-        r#""outcome":"deny","rule":"hard-denies","pattern":"[git -... checkout ...]","bindings":{},"#,
+        r#""outcome":"deny","rule":"hard-denies","pattern":"[git -... checkout ...]","bindings":{},"facts":[],"#,
         r#""reason":"claude-guard denied `git checkout main`: git checkout overwrites working files and can lose uncommitted work. "#,
         r#"Instead: ask the user; in a jj repo, `jj edit <rev>` or `jj new <rev>`."}"#,
       )
@@ -528,12 +545,51 @@ mod tests {
     let r = record("s1", bash("cargo build"));
     assert_eq!(r.outcome, Outcome::Pass);
     assert_eq!((r.rule, r.pattern, r.reason), (None, None, None));
+    // A pass still ran the git-in-jj rule's `:when`, so the record says so.
     let json = serde_json::to_string(&record("s1", bash("cargo build"))).unwrap();
     assert!(
-      json
-        .ends_with(r#""outcome":"pass","rule":null,"pattern":null,"bindings":null,"reason":null}"#),
+      json.ends_with(
+        r#""outcome":"pass","rule":null,"pattern":null,"bindings":null,"facts":[{"name":"ancestor-has?","args":[".jj"],"truth":"false","reason":null,"ms":0}],"reason":null}"#
+      ),
       "{json}"
     );
+  }
+
+  #[test]
+  fn a_record_names_every_fact_the_evaluation_asked() {
+    // `git stash` reaches the stash row, whose condition asks for `.jj`
+    // above cwd; the stub answers false, so the row does not fire and
+    // the git-in-jj rule's `:when` asks the same fact and hits the memo.
+    let r = record("s1", bash("git stash"));
+    assert_eq!(r.outcome, Outcome::Pass);
+    let facts = r.facts.clone().unwrap();
+    assert_eq!(facts.len(), 1, "{facts:?}");
+    assert_eq!(facts[0].name, FactName::from("ancestor-has?"));
+    assert_eq!(facts[0].args, vec![".jj".to_string()]);
+    assert_eq!(facts[0].truth, Truth::False);
+    assert_eq!(facts[0].reason, None);
+    let json = serde_json::to_string(&r).unwrap();
+    assert!(
+      json.contains(
+        r#""facts":[{"name":"ancestor-has?","args":[".jj"],"truth":"false","reason":null,"ms":0}]"#
+      ),
+      "{json}"
+    );
+    // An observed event asked nothing: null, not an empty list.
+    let observed = Record::observed(
+      &crate::input::envelope(
+        r#"{"session_id":"s","cwd":"/x","hook_event_name":"SessionStart","source":"startup"}"#,
+      )
+      .unwrap(),
+      at("2026-09-05T10:00:00Z"),
+    );
+    assert_eq!(observed.facts, None);
+    // A line written before the field existed reads back as null.
+    let old = serde_json::to_string(&r).unwrap().replace(
+      r#""facts":[{"name":"ancestor-has?","args":[".jj"],"truth":"false","reason":null,"ms":0}],"#,
+      "",
+    );
+    assert_eq!(serde_json::from_str::<Record>(&old).unwrap().facts, None);
   }
 
   #[test]

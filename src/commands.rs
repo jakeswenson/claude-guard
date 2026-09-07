@@ -692,6 +692,7 @@ mod tests {
     Record::pre_tool_use(
       &ctx,
       verdict.as_ref(),
+      rules.facts_asked(),
       "2026-09-06T00:00:00Z".parse().unwrap(),
     )
   }

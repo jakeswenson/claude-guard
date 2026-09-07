@@ -135,6 +135,7 @@ fn hook_writes_one_log_line_per_call_including_passes() {
   assert_eq!(deny["rule"], "hard-denies");
   assert_eq!(deny["pattern"], "[git -... checkout ...]");
   assert_eq!(deny["bindings"], serde_json::json!({}));
+  assert_eq!(deny["facts"], serde_json::json!([]));
   assert!(
     deny["reason"]
       .as_str()
@@ -266,6 +267,24 @@ fn a_declared_fact_runs_a_program_whose_answer_decides() {
     .stdout(predicate::str::contains(
       "claude-guard asks about `cargo clean`: slow. Instead: wait. (slow? is unknown: timed out after 200ms)",
     ));
+
+  // Both records name the fact they asked, its answer, and its timing.
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let lines: Vec<serde_json::Value> = log
+    .lines()
+    .map(|line| serde_json::from_str(line).unwrap())
+    .collect();
+  let managed = &lines[0]["facts"][0];
+  assert_eq!(managed["name"], "managed?");
+  assert_eq!(managed["args"], serde_json::json!([]));
+  assert_eq!(managed["truth"], "true");
+  assert_eq!(managed["reason"], "the script said so");
+  assert!(managed["ms"].as_u64().is_some());
+  let slow = &lines[1]["facts"][0];
+  assert_eq!(slow["name"], "slow?");
+  assert_eq!(slow["truth"], "unknown");
+  assert_eq!(slow["reason"], "timed out after 200ms");
+  assert!(slow["ms"].as_u64().unwrap() >= 200, "{slow}");
 }
 
 #[test]

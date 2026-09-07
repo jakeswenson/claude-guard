@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cond::{self, Choice};
 use crate::elaborate::{Declarations, Elaborated, Inner};
-use crate::facts::{Call, Facts, Truth};
+use crate::facts::{Asked, Call, Facts, Truth};
 use crate::input::{HookInput, Tool, string_id};
 use crate::load::{self, LoadError, Loaded, Source};
 use crate::log;
@@ -196,11 +196,19 @@ impl Ruleset {
     }
   }
 
+  /// The facts the last [`Ruleset::evaluate`] asked, in order, with
+  /// their answers and timings, for the log record. Clears the list.
+  pub fn facts_asked(&self) -> Vec<Asked> {
+    self.facts.take_asked()
+  }
+
   /// First opinion wins. `None` means the call proceeds untouched.
   pub fn evaluate(
     &self,
     ctx: &Context,
   ) -> Option<Verdict> {
+    // What this evaluation asks starts from nothing.
+    let _ = self.facts.take_asked();
     if let Seen::Bash(Err(e)) = &ctx.seen {
       return Some(Verdict {
         rule: RuleName::from("parse-error"),

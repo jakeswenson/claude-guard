@@ -15,8 +15,9 @@
 //!
 //! The registry memoizes: one fact asked twice with the same arguments
 //! in the same cwd answers once, so a program declared as a fact runs at
-//! most once per hook call however many rows name it. The log's list of
-//! facts used will hang off the same place.
+//! most once per hook call however many rows name it. It also keeps the
+//! list of what was asked, in order, with each answer and how long it
+//! took, which the log record carries (principle 12).
 
 mod ancestor_has;
 mod exec;
@@ -27,9 +28,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub use ancestor_has::AncestorHas;
 pub use exec::Exec;
+use serde::{Deserialize, Serialize};
 pub use stubs::{Ancestors, Stub};
 pub use under::Under;
 
@@ -44,7 +47,8 @@ string_id! {
 }
 
 /// What a fact evaluates to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Truth {
   True,
   False,
@@ -178,15 +182,29 @@ pub trait Fact {
 
 /// What one answer was asked under: the fact, its arguments, and the
 /// cwd, which every built-in reads.
-type Asked = (FactName, Vec<String>, PathBuf);
+type Key = (FactName, Vec<String>, PathBuf);
+
+/// One fact asked during a call, as the log record keeps it: the fact,
+/// its arguments, what it answered, and how long it took. A memoized
+/// answer is not asked again and so appears once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Asked {
+  pub name: FactName,
+  pub args: Vec<String>,
+  pub truth: Truth,
+  /// The fact's own reason, without the registry's `is unknown` prefix.
+  pub reason: Option<String>,
+  pub ms: u64,
+}
 
 /// Every fact a file may name. Built-ins come first; a later declaration
 /// under the same name replaces the earlier one, which is how the spec
 /// and the tests stand in for the disk. Cloning gives a registry with
-/// the same facts and an empty memo.
+/// the same facts, an empty memo, and nothing asked.
 pub struct Facts {
   by_name: BTreeMap<FactName, Arc<dyn Fact>>,
-  memo: RefCell<HashMap<Asked, Answer>>,
+  memo: RefCell<HashMap<Key, Answer>>,
+  asked: RefCell<Vec<Asked>>,
 }
 
 impl Clone for Facts {
@@ -194,6 +212,7 @@ impl Clone for Facts {
     Facts {
       by_name: self.by_name.clone(),
       memo: RefCell::new(HashMap::new()),
+      asked: RefCell::new(Vec::new()),
     }
   }
 }
@@ -204,7 +223,14 @@ impl Facts {
     Facts {
       by_name: BTreeMap::new(),
       memo: RefCell::new(HashMap::new()),
+      asked: RefCell::new(Vec::new()),
     }
+  }
+
+  /// Everything asked since the last call, in order, and clear the list.
+  /// The memo stays, so a fact asked again still answers from it.
+  pub fn take_asked(&self) -> Vec<Asked> {
+    std::mem::take(&mut *self.asked.borrow_mut())
   }
 
   /// The facts the binary ships: `ancestor-has?` and `under?`.
@@ -242,7 +268,7 @@ impl Facts {
     args: &[&str],
     call: &Call<'_>,
   ) -> Answer {
-    let key: Asked = (
+    let key: Key = (
       name.clone(),
       args.iter().map(|a| a.to_string()).collect(),
       call.cwd.to_path_buf(),
@@ -253,7 +279,16 @@ impl Facts {
     let Some(fact) = self.get(name) else {
       return Answer::unknown(format!("no fact named `{name}`"));
     };
+    let started = Instant::now();
     let answer = fact.ask(args, call);
+    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    self.asked.borrow_mut().push(Asked {
+      name: name.clone(),
+      args: key.1.clone(),
+      truth: answer.truth,
+      reason: answer.reason.clone(),
+      ms,
+    });
     let answer = match answer.truth {
       Truth::Unknown => Answer::unknown(format!(
         "{name} is unknown: {}",
@@ -372,6 +407,64 @@ mod tests {
     // A clone starts with an empty memo and the same facts.
     facts.clone().ask(&name, &["a"], &here);
     assert_eq!(count.get(), 4);
+  }
+
+  #[test]
+  fn what_was_asked_is_kept_in_order_with_answers_and_timings() {
+    let mut facts = Facts::builtin();
+    facts.declare("slow?", Stub(Answer::unknown("timed out")));
+    facts.declare("yes?", Stub(Answer::holds().with_reason("as is")));
+    let cwd = Path::new("/x");
+    facts.ask(&FactName::from("yes?"), &["a", "b"], &call(cwd));
+    facts.ask(&FactName::from("slow?"), &[], &call(cwd));
+    facts.ask(&FactName::from("under?"), &["/x/y", "/x"], &call(cwd));
+    // A memoized answer is not asked again.
+    facts.ask(&FactName::from("yes?"), &["a", "b"], &call(cwd));
+    let asked = facts.take_asked();
+    let seen: Vec<(String, Vec<String>, Truth, Option<String>)> = asked
+      .iter()
+      .map(|a| {
+        (
+          a.name.to_string(),
+          a.args.clone(),
+          a.truth,
+          a.reason.clone(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      seen,
+      [
+        (
+          "yes?".to_string(),
+          vec!["a".to_string(), "b".to_string()],
+          Truth::True,
+          Some("as is".to_string())
+        ),
+        (
+          "slow?".to_string(),
+          vec![],
+          Truth::Unknown,
+          Some("timed out".to_string())
+        ),
+        (
+          "under?".to_string(),
+          vec!["/x/y".to_string(), "/x".to_string()],
+          Truth::True,
+          None
+        ),
+      ]
+    );
+    assert!(asked.iter().all(|a| a.ms < 1000));
+    // Taking clears the list and leaves the memo.
+    assert!(facts.take_asked().is_empty());
+    facts.ask(&FactName::from("yes?"), &["a", "b"], &call(cwd));
+    assert!(facts.take_asked().is_empty());
+    // The record's shape.
+    assert_eq!(
+      serde_json::to_string(&asked[1]).unwrap(),
+      r#"{"name":"slow?","args":[],"truth":"unknown","reason":"timed out","ms":0}"#
+    );
   }
 
   #[test]

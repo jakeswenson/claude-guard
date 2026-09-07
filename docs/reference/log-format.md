@@ -19,6 +19,10 @@ One file per session at `<state dir>/sessions/<session id>.jsonl`, one JSON obje
   "rule": "hard-denies",
   "pattern": "[git -... checkout ...]",
   "bindings": {},
+  "facts": [
+    {"name": "ancestor-has?", "args": [".jj"], "truth": "true", "reason": null, "ms": 0},
+    {"name": "managed?", "args": [], "truth": "unknown", "reason": "timed out after 1s", "ms": 1001}
+  ],
   "reason": "claude-guard denied `git checkout main`: ..."
 }
 ```
@@ -38,6 +42,7 @@ One file per session at `<state dir>/sessions/<session id>.jsonl`, one JSON obje
 | `rule` | string or null | The rule that fired, or `parse-error` and `uninspected` for the engine's own answers. |
 | `pattern` | string or null | The row's subject as written in the file. Null for the engine's own answers. |
 | `bindings` | object or null | What the row's binders captured, name to word. Null when no row fired. Absent on lines written before it existed. |
+| `facts` | array or null | Every fact the evaluation asked, in order: `name`, `args` as passed, `truth` as `true`, `false`, or `unknown`, the fact's own `reason` or null, and `ms` it took. A fact asked twice with the same arguments appears once. Empty when no condition ran; null on observed events. Absent on lines written before it existed. |
 | `reason` | string or null | The text the model or the user saw, exactly as rendered. |
 
 `outcome` is `observed` for every event other than `PreToolUse`, and for a `PreToolUse` call made while the rule file failed to load.

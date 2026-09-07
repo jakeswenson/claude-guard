@@ -83,7 +83,7 @@ One binary, flat modules, no `mod.rs`. A hook call flows top to bottom:
 - `pattern.rs`: the matcher over elaborated units. Tokens keep their meaning; a declaration changes what they see.
 - `rules.rs`: the engine. Parse error asks; rules in order, first row wins, through inner commands to depth 8; a matched deny or ask row with an unknown condition asks with the evidence in parentheses, a warn row skips; uninspected substitutions warn.
 - `output.rs`: the Claude Code wire format for deny, ask, and warn.
-- `log.rs`: one typed JSONL record per hook call, schema v1, written before stdout, never changing the decision.
+- `log.rs`: one typed JSONL record per hook call, schema v1, written before stdout, never changing the decision; the `facts` field lists every fact the evaluation asked with its answer and timing.
 - `commands.rs`: the `commands` survey over the logs and `commands add` from carapace.
 - `spec.rs`: the `check` runner.
 

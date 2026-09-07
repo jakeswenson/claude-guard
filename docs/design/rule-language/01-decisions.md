@@ -218,6 +218,14 @@ arguments.
   `sh -c` left its `sleep` holding the hook's stderr, which would keep
   Claude Code waiting past the timeout the rule promised. Made while
   implementing D9, 2026-09-07.
+- **D31** — The record's `facts` field: every fact the evaluation asked,
+  in order, with name, arguments, truth, the fact's own reason, and
+  milliseconds, kept at the registry as it answers. A memoized answer is
+  not asked again and so appears once. Empty when no condition ran, null
+  on observed events, additive under schema 1 with a default for old
+  lines. This is the log half of principle 12 and the data ADR 0002
+  waits on for a default timeout. Made while implementing D8's record
+  kind, 2026-09-07.
 
 ## Scope: first version
 
