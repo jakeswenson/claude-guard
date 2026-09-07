@@ -9,6 +9,7 @@
 mod commands;
 mod cond;
 mod elaborate;
+mod facts;
 mod input;
 mod load;
 mod log;
@@ -329,7 +330,7 @@ fn pre_tool_use(raw: &str) -> Result<()> {
   };
   let input = input::parse(raw)?;
   let ctx = rules::Context::new(input, &rules.declarations);
-  let verdict = rules.evaluate(&ctx, &cond::RealFs);
+  let verdict = rules.evaluate(&ctx);
 
   record(log::Record::pre_tool_use(
     &ctx,

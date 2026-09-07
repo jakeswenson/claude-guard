@@ -57,15 +57,23 @@ A pattern may match in more than one way when it holds `...` or `-...`. Each way
 ### Conditions
 
 ```
-cond := (ancestor-has? "name")
-      | (under? <arg> "prefix")
+cond := (<fact> arg*)
       | (and cond+) | (or cond+) | (not cond)
-arg  := ?name | "path"
+arg  := ?name | "text"
 ```
 
-`ancestor-has?` holds when the call's working directory or any directory above it contains an entry named `name`. `under?` holds when the path, resolved against the working directory if relative and with `/private` stripped, is the prefix or below it by path component.
+A fact is a proposition about the call: named in a condition with its arguments, it holds, fails, or is unknown. The name ends in `?`. Naming a fact the guard does not know is a load error, and each fact checks its own arguments at load time.
 
-Conditions are three-valued: true, false, unknown. `and`, `or`, and `not` follow Kleene's tables: one false settles an `and`, one true settles an `or`, `not` swaps true and false, and everything else that touches an unknown is unknown. Nothing produces unknown in this version; the seam exists for predicates that ask a program.
+Two facts exist:
+
+| Fact | Holds when |
+|---|---|
+| `(ancestor-has? "name")` | the call's working directory or any directory above it contains an entry named `name` |
+| `(under? <arg> "prefix")` | the path, resolved against the working directory if relative and with `/private` stripped, is the prefix or below it by path component |
+
+Conditions are three-valued: true, false, unknown. `and`, `or`, and `not` follow Kleene's tables: one false settles an `and`, one true settles an `or`, `not` swaps true and false, and everything else that touches an unknown is unknown. Nothing produces unknown in this version; a fact that asks a program will.
+
+An answer carries a reason when the fact gave one. An unknown `and` or `or` carries the reason of its first unknown part, in evaluation order. A settled one carries the deciding part's reason, or every part's reasons joined with `; ` when all agreed. `not` keeps the reason and flips the truth. Reasons are evidence for the log and the deny text; they never change a decision.
 
 A binder in a row's condition must be declared by the row's pattern. A rule's `:when` runs before any pattern matches and may use no binders. Both are load errors.
 

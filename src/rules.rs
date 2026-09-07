@@ -13,8 +13,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::cond::{self, Env, Fs, Truth};
+use crate::cond;
 use crate::elaborate::{Declarations, Elaborated, Inner};
+use crate::facts::{Call, Facts, Truth};
 use crate::input::{HookInput, Tool, string_id};
 use crate::load::{self, LoadError, Loaded, Source};
 use crate::output::Decision;
@@ -121,9 +122,11 @@ pub struct Verdict {
 /// A loaded rule table, ready to evaluate.
 pub struct Ruleset {
   pub source: Source,
-  /// Every command declaration in force. The matcher starts using them
-  /// in claude-guard-1ma.3.
+  /// Every command declaration in force.
   pub declarations: Declarations,
+  /// Every fact the rules may name. The built-ins today; the file's own
+  /// declarations join them when extern facts land.
+  pub facts: Facts,
   rules: Vec<Rule>,
 }
 
@@ -156,7 +159,6 @@ impl Ruleset {
   pub fn evaluate(
     &self,
     ctx: &Context,
-    fs: &dyn Fs,
   ) -> Option<Verdict> {
     if let Seen::Bash(Err(e)) = &ctx.seen {
       return Some(Verdict {
@@ -169,18 +171,17 @@ impl Ruleset {
       });
     }
 
-    let env = Env {
+    let call = Call {
       cwd: ctx.input.cwd.as_ref(),
-      fs,
     };
     for rule in &self.rules {
       if let Some(when) = &rule.when
-        && when.eval(&env, &Bindings::new()) != Truth::True
+        && when.eval(&self.facts, &call, &Bindings::new()).truth != Truth::True
       {
         continue;
       }
       for row in &rule.rows {
-        if let Some((what, bindings)) = find(row, ctx, &self.declarations, &env) {
+        if let Some((what, bindings)) = find(row, ctx, &self.declarations, &self.facts, &call) {
           return Some(Verdict {
             rule: rule.name.clone(),
             pattern: Some(PatternText::from(row.subject.to_string())),
@@ -219,6 +220,7 @@ impl From<Loaded> for Ruleset {
     Ruleset {
       source: loaded.source,
       declarations: loaded.declarations,
+      facts: Facts::builtin(),
       rules: loaded.file.rules,
     }
   }
@@ -234,13 +236,14 @@ fn find(
   row: &Row,
   ctx: &Context,
   declarations: &Declarations,
-  env: &Env<'_>,
+  facts: &Facts,
+  call: &Call<'_>,
 ) -> Option<(String, Bindings)> {
   match (&row.subject, &ctx.seen) {
     (Subject::Command(pattern), Seen::Bash(Ok(_))) => ctx
       .elaborated
       .iter()
-      .find_map(|command| find_in(row, pattern, command, declarations, env, 0)),
+      .find_map(|command| find_in(row, pattern, command, declarations, facts, call, 0)),
     (Subject::Tool(wanted), Seen::File { tool, path }) if wanted.tool == *tool => {
       let text = path.to_string_lossy().into_owned();
       let candidate = match &wanted.path {
@@ -252,7 +255,7 @@ fn find(
         }
         PathArg::Var(var) => Bindings::from([(var.clone(), text.clone())]),
       };
-      let chosen = cond::choose(row.when.as_ref(), vec![candidate], env)?;
+      let chosen = cond::choose(row.when.as_ref(), vec![candidate], facts, call)?;
       Some((text, chosen))
     }
     _ => None,
@@ -267,23 +270,26 @@ fn find_in(
   pattern: &Pattern,
   command: &Elaborated,
   declarations: &Declarations,
-  env: &Env<'_>,
+  facts: &Facts,
+  call: &Call<'_>,
   depth: usize,
 ) -> Option<(String, Bindings)> {
   let candidates = pattern.bindings_in(&command.units(), &command.redirects);
-  if let Some(chosen) = cond::choose(row.when.as_ref(), candidates, env) {
+  if let Some(chosen) = cond::choose(row.when.as_ref(), candidates, facts, call) {
     return Some((describe(command), chosen));
   }
   if depth >= INNER_DEPTH {
     return None;
   }
   match &command.inner {
-    Some(Inner::Command(inner)) => find_in(row, pattern, inner, declarations, env, depth + 1),
+    Some(Inner::Command(inner)) => {
+      find_in(row, pattern, inner, declarations, facts, call, depth + 1)
+    }
     Some(Inner::Script(text)) => {
       let segments = segment::segment(text).ok()?;
       segments.commands.iter().find_map(|simple| {
         let inner = declarations.elaborate(simple);
-        find_in(row, pattern, &inner, declarations, env, depth + 1)
+        find_in(row, pattern, &inner, declarations, facts, call, depth + 1)
       })
     }
     None => None,
@@ -338,29 +344,33 @@ fn describe(command: &Elaborated) -> String {
 #[cfg(test)]
 pub mod testing {
   use super::*;
+  use crate::facts::Ancestors;
 
-  /// A filesystem that answers `ancestor-has?` from a fixed list.
-  pub struct FakeFs(pub Vec<&'static str>);
-
-  impl Fs for FakeFs {
-    fn ancestor_has(
-      &self,
-      _cwd: &Path,
-      name: &str,
-    ) -> Truth {
-      self.0.contains(&name).into()
-    }
+  /// `rules` with `ancestor-has?` answering from a list: a `.jj` above
+  /// cwd, or nothing at all. The disk is never consulted.
+  pub fn in_repo(
+    mut rules: Ruleset,
+    jj: bool,
+  ) -> Ruleset {
+    rules.facts.declare(
+      "ancestor-has?",
+      Ancestors {
+        present: if jj { vec![".jj".into()] } else { vec![] },
+        unknown: false,
+      },
+    );
+    rules
   }
 
-  /// A filesystem with a `.jj` above cwd, or without one.
-  pub fn repo(jj: bool) -> FakeFs {
-    FakeFs(if jj { vec![".jj"] } else { vec![] })
+  /// The shipped rules, in or out of a jj repo.
+  pub fn builtin_in_repo(jj: bool) -> Ruleset {
+    in_repo(Ruleset::builtin(), jj)
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::testing::repo;
+  use super::testing::{builtin_in_repo, in_repo};
   use super::*;
   use crate::pattern::Var;
 
@@ -384,11 +394,8 @@ mod tests {
     tool: Tool,
     in_jj_repo: bool,
   ) -> Option<Verdict> {
-    let rules = Ruleset::builtin();
-    rules.evaluate(
-      &Context::new(input(tool), &rules.declarations),
-      &repo(in_jj_repo),
-    )
+    let rules = builtin_in_repo(in_jj_repo);
+    rules.evaluate(&Context::new(input(tool), &rules.declarations))
   }
 
   fn deny_reason(verdict: Option<Verdict>) -> String {
@@ -678,8 +685,8 @@ mod tests {
   fn a_relative_target_counts_when_cwd_is_under_tmp() {
     let mut input = input(bash("echo hi > out.txt"));
     input.cwd = "/tmp/work".into();
-    let rules = Ruleset::builtin();
-    let verdict = rules.evaluate(&Context::new(input, &rules.declarations), &repo(false));
+    let rules = builtin_in_repo(false);
+    let verdict = rules.evaluate(&Context::new(input, &rules.declarations));
     assert_eq!(rule_name(verdict), "tmp-writes");
   }
 
@@ -799,11 +806,11 @@ mod tests {
     text: &str,
     tool: Tool,
   ) -> Option<Verdict> {
-    let rules = Ruleset::from_text(text).unwrap_or_else(|e| panic!("{e}"));
-    rules.evaluate(
-      &Context::new(input(tool), &rules.declarations),
-      &repo(false),
-    )
+    let rules = in_repo(
+      Ruleset::from_text(text).unwrap_or_else(|e| panic!("{e}")),
+      false,
+    );
+    rules.evaluate(&Context::new(input(tool), &rules.declarations))
   }
 
   // --- elaboration: declared commands and inner commands ---

@@ -78,7 +78,8 @@ One binary, flat modules, no `mod.rs`. A hook call flows top to bottom:
 - `input.rs`: the hook payload as typed structs; the `string_id!` newtypes (`SessionId`, `ToolUseId`, `RuleName`, ...); tool inputs as a `Tool` enum.
 - `segment.rs`: a Bash command to simple commands via brush-parser: words after quote removal, literal or dynamic, plus file redirects; `$(...)` text is reported as uninspected.
 - `elaborate.rs`: a simple command classified under a declaration: name, options with values, args, subcommand path, inner command or script. A partition of the words; `flatten` returns the input.
-- `sexp.rs`, `syntax.rs`, `cond.rs`, `load.rs`: the rule language. Reader with positions; forms to a typed table (`rule`, rows, patterns, `command` declarations); conditions with three-valued evaluation; which files load and how declarations merge.
+- `sexp.rs`, `syntax.rs`, `cond.rs`, `load.rs`: the rule language. Reader with positions; forms to a typed table (`rule`, rows, patterns, `command` declarations); conditions with three-valued evaluation and reasons; which files load and how declarations merge.
+- `facts.rs` and `facts/*.rs`: every fact a condition can name, one type per fact behind the `Fact` trait, in a `Facts` registry the conditions consult by name. Built-ins are `ancestor_has.rs` and `under.rs`; `stubs.rs` stands in by name for the spec and the tests, so nothing there touches the disk. Extern facts will be one more type here.
 - `pattern.rs`: the matcher over elaborated units. Tokens keep their meaning; a declaration changes what they see.
 - `rules.rs`: the engine. Parse error asks; rules in order, first row wins, through inner commands to depth 8; uninspected substitutions warn.
 - `output.rs`: the Claude Code wire format for deny, ask, and warn.
@@ -86,9 +87,9 @@ One binary, flat modules, no `mod.rs`. A hook call flows top to bottom:
 - `commands.rs`: the `commands` survey over the logs and `commands add` from carapace.
 - `spec.rs`: the `check` runner.
 
-Conditions are three-valued: true, false, unknown, combined by Kleene's tables (false AND unknown is false, true OR unknown is true, NOT leaves unknown alone, everything else with an unknown stays unknown). Nothing produces unknown yet; the seam is for extern predicates and cwd tracking, and the design turns unknown on a matched pattern into an ask. `docs/explanation/why-a-policy-language.md` has the tables and the reasons.
+Conditions are three-valued: true, false, unknown, combined by Kleene's tables (false AND unknown is false, true OR unknown is true, NOT leaves unknown alone, everything else with an unknown stays unknown). Every answer can carry a reason; an unknown always does. Nothing in the binary produces unknown yet; extern facts and cwd tracking will, and the design turns unknown on a matched pattern into an ask (D14, ADR 0001). `docs/explanation/why-a-policy-language.md` has the tables and the reasons.
 
-Design decisions and their reasons are in `docs/design/*/01-decisions.md`, in the user's words, with the principles distilled next to them. Read those before changing the engine or the language.
+Design decisions and their reasons are in `docs/design/*/01-decisions.md`, in the user's words, with the principles distilled next to them. Read those before changing the engine or the language. Choices made while building that need review on their own go in `docs/adrs/NNNN-title.md`: status and date, decision first, then context, options, and consequences. Each ADR names the decision-log entries it extends.
 
 ## Conventions & Patterns
 

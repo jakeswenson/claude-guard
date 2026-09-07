@@ -53,7 +53,7 @@ prints the rules in force. The guard exits 0 whatever happens, so a bug in it ne
 - [Getting started](docs/tutorials/getting-started.md): install, wire the hooks, watch a deny, write a rule, declare a command. One sitting.
 - How-to guides: [write a rule](docs/how-to/write-a-rule.md), [declare a command](docs/how-to/declare-a-command.md), [replace the built-in rules](docs/how-to/replace-the-builtin-rules.md), [review what the guard is doing](docs/how-to/review-the-guard.md).
 - Reference: [the rule language](docs/reference/rule-language.md), [the command line](docs/reference/command-line.md), [hooks](docs/reference/hooks.md), [the log format](docs/reference/log-format.md).
-- Explanation: [why a policy language](docs/explanation/why-a-policy-language.md), [elaboration](docs/explanation/elaboration.md), and the [design decision logs](docs/design/) that record how the design was reached.
+- Explanation: [why a policy language](docs/explanation/why-a-policy-language.md), [elaboration](docs/explanation/elaboration.md), the [design decision logs](docs/design/) that record how the design was reached, and the [architecture decision records](docs/adrs/) for choices made while building.
 
 ## What it does today
 
@@ -67,7 +67,7 @@ prints the rules in force. The guard exits 0 whatever happens, so a bug in it ne
 
 - No review UI. The log is JSONL; `claude-guard commands` and `claude-guard elaborate --check-log` are the two readers so far.
 - No memory of your dialog answers, and no escalation from deny to ask on a repeat.
-- No predicates beyond the filesystem near the working directory. Extern predicates, session facts, and history predicates are designed and not built.
+- No facts beyond the filesystem near the working directory. Extern facts, session facts, and history facts are designed and not built.
 - No pruning of old session files.
 
 The [design decision logs](docs/design/) say what is planned and why.

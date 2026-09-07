@@ -454,7 +454,7 @@ pub fn add(
   // Never write a file the loader would reject.
   let forms = crate::sexp::read_all(&text)
     .map_err(|e| color_eyre::eyre::eyre!("generated text does not read: {e}"))?;
-  let file = crate::syntax::parse(&forms).map_err(|errors| {
+  let file = crate::syntax::parse(&forms, &crate::facts::Facts::builtin()).map_err(|errors| {
     color_eyre::eyre::eyre!(
       "generated declaration does not type-check: {}",
       errors
@@ -498,7 +498,7 @@ pub fn add(
 mod tests {
   use super::*;
   use crate::input::{HookInput, Tool};
-  use crate::rules::testing::repo;
+  use crate::rules::testing::builtin_in_repo;
   use crate::rules::{Context, Ruleset};
 
   const GIT_EXPORT: &str = r#"{
@@ -574,7 +574,8 @@ mod tests {
     );
     // What it wrote loads.
     let forms = crate::sexp::read_all(&text).unwrap();
-    let file = crate::syntax::parse(&forms).unwrap_or_else(|e| panic!("{e:?}"));
+    let file = crate::syntax::parse(&forms, &crate::facts::Facts::builtin())
+      .unwrap_or_else(|e| panic!("{e:?}"));
     assert_eq!(file.commands[0].declaration.options.len(), 8);
     assert_eq!(file.commands[0].declaration.subcommands.len(), 3);
   }
@@ -687,7 +688,7 @@ mod tests {
       },
       &rules.declarations,
     );
-    let verdict = rules.evaluate(&ctx, &repo(true));
+    let verdict = rules.evaluate(&ctx);
     Record::pre_tool_use(
       &ctx,
       verdict.as_ref(),
@@ -697,7 +698,7 @@ mod tests {
 
   #[test]
   fn survey_counts_calls_generic_hits_and_flagged_calls() {
-    let rules = Ruleset::builtin();
+    let rules = builtin_in_repo(true);
     let records: Vec<Record> = [
       "git -C . push origin main",
       "git -C . log",
@@ -755,7 +756,7 @@ mod tests {
 
   #[test]
   fn survey_without_carapace_marks_the_column_unknown() {
-    let rules = Ruleset::builtin();
+    let rules = builtin_in_repo(true);
     let records = vec![record("ls", &rules)];
     let empty = BTreeSet::new();
     let rows = survey(
@@ -778,7 +779,7 @@ mod tests {
 
   #[test]
   fn a_catch_all_only_program_never_has_generic_hits() {
-    let rules = Ruleset::builtin();
+    let rules = builtin_in_repo(true);
     let records = vec![
       record("grep -r foo src", &rules),
       record("git reflog", &rules),

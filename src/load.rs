@@ -305,7 +305,7 @@ fn parse_text(
   text: &str,
 ) -> Result<File, LoadError> {
   let forms = sexp::read_all(text).map_err(|e| LoadError::one(source.clone(), Problem::Read(e)))?;
-  syntax::parse(&forms).map_err(|errors| LoadError {
+  syntax::parse(&forms, &crate::facts::Facts::builtin()).map_err(|errors| LoadError {
     problems: errors
       .into_iter()
       .map(|e| Located {

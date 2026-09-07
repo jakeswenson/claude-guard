@@ -462,7 +462,7 @@ mod tests {
   use super::*;
   use crate::input::HookInput;
   use crate::rules::Ruleset;
-  use crate::rules::testing::repo;
+  use crate::rules::testing::builtin_in_repo;
 
   fn at(rfc3339: &str) -> Timestamp {
     rfc3339.parse().unwrap()
@@ -495,7 +495,7 @@ mod tests {
     tool: Tool,
   ) -> Record {
     let ctx = context(session, tool);
-    let verdict = Ruleset::builtin().evaluate(&ctx, &repo(false));
+    let verdict = builtin_in_repo(false).evaluate(&ctx);
     Record::pre_tool_use(&ctx, verdict.as_ref(), at("2026-09-05T10:00:00Z"))
   }
 

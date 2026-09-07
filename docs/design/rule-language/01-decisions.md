@@ -185,6 +185,14 @@ arguments.
   every file in the config `commands/` directory, the user's winning by
   name. Unlike rules, which replace whole, a declaration is a fact about
   a program rather than a policy.
+- **D28** — A fact's answer is a truth and an optional reason, and the
+  reason travels through the combinators by fixed rules: an unknown
+  `and` or `or` carries its first unknown part's reason in evaluation
+  order; a settled one carries the deciding part's reason, or every
+  part's reasons joined with `; ` when all agreed; `not` keeps the
+  reason. The reason is evidence (D10) and never changes a truth. The
+  spec states each rule with `:facts` stubs and a `"reason"` after the
+  verb. Made while implementing ADR 0003, 2026-09-07.
 
 ## Scope: first version
 
@@ -250,6 +258,18 @@ Status of the baseline principles in `02-principles.md` after the
   appended in parentheses.
 - P9 builtins are a file too. **Unchallenged**; carried forward.
 - P10 written semantics. **Unchallenged**; D7 gives it a name.
+
+## Architecture decision records
+
+Choices made while building that extend a decision here live in
+`docs/adrs/` and are reviewed on their own:
+
+- ADR 0001 extends D14: a rule-level `:when` that is unknown asks on a
+  matching row.
+- ADR 0002 answers the default-timeout question below: no defaults for
+  `:lifetime` or `:timeout` until the log has timings.
+- ADR 0003 shapes D5, D8, and D9 in code: facts are one module with one
+  trait and one registry, built-in and extern alike.
 
 ## Open Questions
 

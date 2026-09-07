@@ -5,19 +5,24 @@
 //!        | (check [pattern] misses  "command" [decls])
 //!        | (check [pattern] binds   "command" <set> [decls])
 //!        | (check "command" elaborates (name item...) [decls])
-//!        | (check (cond) holds|fails|unknown [:with <pairs>] [:cwd "path"] [:ancestors <fs>])
+//!        | (check (cond) holds|fails|unknown ["reason"]
+//!                 [:with <pairs>] [:cwd "path"] [:ancestors <fs>] [:facts (<stub>...)])
 //! decls := :commands ((command ...) ...)   ; declarations in force for this check
 //! set   := (?name "word")*            ; one binding set, as pairs
 //!        | ((?name "word")*)+         ; several sets, each in its own list
 //! fs    := ("name" ...)               ; entries an ancestor of cwd has; the rest do not
-//!        | unknown                    ; the filesystem answers unknown
+//!        | unknown                    ; ancestor-has? answers unknown
+//! stub  := (<name> holds|fails|unknown ["reason"])   ; a fact and its fixed answer
 //! ```
 //!
 //! A command must segment to one simple command. `binds` passes when the
 //! matcher's binding sets are exactly the ones written, in order. A
 //! condition check parses its condition with the binders `:with` gives
-//! it, so an unbound binder is a failure of the check, not a panic. An
-//! `elaborates` check compares against the notation [`show`] renders.
+//! it, so an unbound binder is a failure of the check, not a panic; its
+//! facts are the built-ins with `:ancestors` and `:facts` stood in by
+//! name, so no check touches the disk. A `"reason"` after the verb must
+//! equal the answer's reason. An `elaborates` check compares against the
+//! notation [`show`] renders.
 //!
 //! Files under `spec/` are the spec. Every failing check prints as
 //! `file:line:col: message`, and the test fails once at the end with the
@@ -29,8 +34,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use crate::cond::{self, Cond, Env, Fs, Scope, Truth};
+use crate::cond::{self, Cond, Scope};
 use crate::elaborate::{Declarations, Elaborated, Inner, Part};
+use crate::facts::{Ancestors, Answer, Call, Facts, Stub, Truth};
 use crate::pattern::{Bindings, Pattern, Var};
 use crate::segment::{self, RedirectKind, SimpleCommand, Word};
 use crate::sexp::{self, Kind as Sx, Node, Span};
@@ -200,7 +206,7 @@ fn split_commands(args: &[Node]) -> Result<(&[Node], Declarations), TypeError> {
       "`:commands` takes a list of (command ...) forms",
     );
   };
-  let file = syntax::parse(forms).map_err(|mut errors| errors.remove(0))?;
+  let file = syntax::parse(forms, &Facts::builtin()).map_err(|mut errors| errors.remove(0))?;
   if let Some(rule) = file.rules.first() {
     return err(
       rule.span,
@@ -472,24 +478,58 @@ fn show(e: &Elaborated) -> Node {
 
 // --- condition checks ---
 
-/// The filesystem a check describes with `:ancestors`.
-struct SpecFs {
-  present: Vec<String>,
-  unknown: bool,
+/// `holds`, `fails`, or `unknown` as a truth value.
+fn truth_verb(
+  node: &Node,
+  what: &str,
+) -> Result<Truth, TypeError> {
+  match &node.kind {
+    Sx::Symbol(s) if s == "holds" => Ok(Truth::True),
+    Sx::Symbol(s) if s == "fails" => Ok(Truth::False),
+    Sx::Symbol(s) if s == "unknown" => Ok(Truth::Unknown),
+    Sx::Symbol(other) => err(node.span, format!("unknown {what} verb `{other}`")),
+    _ => err(
+      node.span,
+      format!("expected a {what} verb: holds, fails, unknown"),
+    ),
+  }
 }
 
-impl Fs for SpecFs {
-  fn ancestor_has(
-    &self,
-    _cwd: &Path,
-    name: &str,
-  ) -> Truth {
-    if self.unknown {
-      Truth::Unknown
-    } else {
-      self.present.iter().any(|p| p == name).into()
-    }
+/// One `(<name> holds|fails|unknown ["reason"])` stub, registered in
+/// `facts`.
+fn declare_stub(
+  node: &Node,
+  facts: &mut Facts,
+) -> Result<(), TypeError> {
+  let Sx::List(items) = &node.kind else {
+    return err(
+      node.span,
+      "`:facts` takes (name holds|fails|unknown [\"reason\"]) forms",
+    );
+  };
+  let [name, verb, rest @ ..] = items.as_slice() else {
+    return err(
+      node.span,
+      "`:facts` takes (name holds|fails|unknown [\"reason\"]) forms",
+    );
+  };
+  let Sx::Symbol(name) = &name.kind else {
+    return err(name.span, "a stubbed fact's name is a symbol");
+  };
+  let truth = truth_verb(verb, "stub")?;
+  let reason = match rest {
+    [] => None,
+    [node] => match &node.kind {
+      Sx::Str(reason) => Some(reason.clone()),
+      _ => return err(node.span, "a stub's reason is a string"),
+    },
+    [_, extra, ..] => return err(extra.span, format!("unexpected `{extra}`")),
+  };
+  if truth == Truth::Unknown && reason.is_none() {
+    return err(verb.span, "an unknown stub needs a reason");
   }
+  facts.declare(name.as_str(), Stub(Answer { truth, reason }));
+  Ok(())
 }
 
 fn check_cond(
@@ -505,20 +545,33 @@ fn check_cond(
     "unknown" => Truth::Unknown,
     other => return err(verb.span, format!("unknown condition verb `{other}`")),
   };
+  let (expected_reason, args) = match args.split_first() {
+    Some((first, rest)) if matches!(&first.kind, Sx::Str(_)) => {
+      let Sx::Str(reason) = &first.kind else {
+        unreachable!("matched a string");
+      };
+      (Some(reason.as_str()), rest)
+    }
+    _ => (None, args),
+  };
 
   let mut bindings = Bindings::new();
   let mut cwd = PathBuf::from("/spec");
-  let mut fs = SpecFs {
-    present: vec![],
-    unknown: false,
-  };
+  let mut facts = Facts::builtin();
+  facts.declare(
+    "ancestor-has?",
+    Ancestors {
+      present: vec![],
+      unknown: false,
+    },
+  );
   let mut i = 0;
   while i < args.len() {
     let key = &args[i];
     let Sx::Keyword(name) = &key.kind else {
       return err(
         key.span,
-        format!("unexpected `{key}`; expected :with, :cwd, or :ancestors"),
+        format!("unexpected `{key}`; expected :with, :cwd, :ancestors, or :facts"),
       );
     };
     let Some(value) = args.get(i + 1) else {
@@ -537,37 +590,66 @@ fn check_cond(
         };
         cwd = PathBuf::from(path);
       }
-      "ancestors" => match &value.kind {
-        Sx::Symbol(s) if s == "unknown" => fs.unknown = true,
-        Sx::List(items) => {
-          fs.present = items
-            .iter()
-            .map(|item| match &item.kind {
-              Sx::Str(s) => Ok(s.clone()),
-              _ => err(item.span, "`:ancestors` takes strings"),
-            })
-            .collect::<Result<_, _>>()?;
-        }
-        _ => {
+      "ancestors" => {
+        let ancestors = match &value.kind {
+          Sx::Symbol(s) if s == "unknown" => Ancestors {
+            present: vec![],
+            unknown: true,
+          },
+          Sx::List(items) => Ancestors {
+            present: items
+              .iter()
+              .map(|item| match &item.kind {
+                Sx::Str(s) => Ok(s.clone()),
+                _ => err(item.span, "`:ancestors` takes strings"),
+              })
+              .collect::<Result<_, _>>()?,
+            unknown: false,
+          },
+          _ => {
+            return err(
+              value.span,
+              "`:ancestors` takes a list of strings or `unknown`",
+            );
+          }
+        };
+        facts.declare("ancestor-has?", ancestors);
+      }
+      "facts" => {
+        let Sx::List(items) = &value.kind else {
           return err(
             value.span,
-            "`:ancestors` takes a list of strings or `unknown`",
+            "`:facts` takes a list of (name verb [\"reason\"]) forms",
           );
+        };
+        for item in items {
+          declare_stub(item, &mut facts)?;
         }
-      },
+      }
       other => return err(key.span, format!("unknown keyword `:{other}`")),
     }
     i += 2;
   }
 
   let scope = Scope::Row(bindings.keys().cloned().collect());
-  let condition: Cond = cond::parse(subject, &scope)?;
-  let env = Env { cwd: &cwd, fs: &fs };
-  let got = condition.eval(&env, &bindings);
-  if got != expected {
+  let condition: Cond = cond::parse(subject, &scope, &facts)?;
+  let call = Call { cwd: &cwd };
+  let got = condition.eval(&facts, &call, &bindings);
+  if got.truth != expected {
     return err(
       form.span,
-      format!("expected {expected:?}, got {got:?}").to_lowercase(),
+      format!("expected {expected:?}, got {:?}", got.truth).to_lowercase(),
+    );
+  }
+  if let Some(wanted) = expected_reason
+    && got.reason.as_deref() != Some(wanted)
+  {
+    return err(
+      form.span,
+      match got.reason {
+        Some(reason) => format!("expected reason {wanted:?}, got {reason:?}"),
+        None => format!("expected reason {wanted:?}, got none"),
+      },
     );
   }
   Ok(())
@@ -671,6 +753,41 @@ mod tests {
     passes("(check (under? \"x\" \"/spec\") holds)");
   }
 
+  #[test]
+  fn facts_are_stubbed_by_name_with_an_answer_and_a_reason() {
+    passes("(check (in-git? \"x\") holds :facts ((in-git? holds)))");
+    passes("(check (slow?) unknown :facts ((slow? unknown \"timed out\")))");
+    passes("(check (slow?) unknown \"timed out\" :facts ((slow? unknown \"timed out\")))");
+    passes(
+      "(check (and (ancestor-has? \"t\") (slow?)) unknown \"timed out\" :ancestors (\"t\") :facts ((slow? unknown \"timed out\")))",
+    );
+    passes("(check (a?) holds \"a held\" :facts ((a? holds \"a held\")))");
+    assert_eq!(
+      failures("(check (slow?) unknown \"timed out\" :facts ((slow? unknown \"crashed\")))"),
+      ["t.scm:1:1: expected reason \"timed out\", got \"crashed\""]
+    );
+    assert_eq!(
+      failures("(check (a?) holds \"a held\" :facts ((a? holds)))"),
+      ["t.scm:1:1: expected reason \"a held\", got none"]
+    );
+    assert_eq!(
+      failures("(check (slow?) unknown)"),
+      ["t.scm:1:9: unknown fact `slow?`"]
+    );
+    assert_eq!(
+      failures("(check (slow?) unknown :facts ((slow? unknown)))"),
+      ["t.scm:1:39: an unknown stub needs a reason"]
+    );
+    assert_eq!(
+      failures("(check (slow?) unknown :facts ((slow? maybe)))"),
+      ["t.scm:1:39: unknown stub verb `maybe`"]
+    );
+    assert_eq!(
+      failures("(check (slow?) unknown :facts (slow?))"),
+      ["t.scm:1:32: `:facts` takes (name holds|fails|unknown [\"reason\"]) forms"]
+    );
+  }
+
   // --- malformed checks are failures with a position ---
 
   #[test]
@@ -756,6 +873,10 @@ mod tests {
     assert_eq!(
       failures("(check (ancestor-has? \"x\") holds :fs ())"),
       ["t.scm:1:34: unknown keyword `:fs`"]
+    );
+    assert_eq!(
+      failures("(check (ancestor-has? \"x\") holds x)"),
+      ["t.scm:1:34: unexpected `x`; expected :with, :cwd, :ancestors, or :facts"]
     );
     assert_eq!(
       failures("(check (ancestor-has? \"x\") holds :cwd)"),

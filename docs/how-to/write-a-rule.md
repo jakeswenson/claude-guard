@@ -62,7 +62,7 @@ A condition guards a row with `:when`, or a whole rule when placed after its nam
 (deny [cp ?src ?dst] :when (and (under? ?src "/etc") (not (under? ?dst "/etc"))) ...)
 ```
 
-Two predicates exist today: `(ancestor-has? "name")`, true when the working directory or any directory above it contains `name`, and `(under? path "prefix")`, true when the path is the prefix or below it. A relative path resolves against the call's working directory, and `/private/tmp` counts as `/tmp`. `and`, `or`, and `not` combine them.
+Two facts exist today: `(ancestor-has? "name")`, true when the working directory or any directory above it contains `name`, and `(under? path "prefix")`, true when the path is the prefix or below it. A relative path resolves against the call's working directory, and `/private/tmp` counts as `/tmp`. `and`, `or`, and `not` combine them. Naming a fact the guard does not know is a load error.
 
 A binder used in a condition must appear in the row's pattern. A rule-level `:when` runs before any pattern matches, so it cannot use binders. Both are load-time errors with a position.
 

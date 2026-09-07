@@ -22,8 +22,8 @@
 //! belong in the condition, as `(under? ?p "/tmp")`.
 //!
 //! `:instead` is required on deny and ask, optional on warn. A condition
-//! is checked by [`cond`] against the binders its pattern declares; a
-//! rule's `:when` may use none.
+//! is checked by [`cond`] against the binders its pattern declares and
+//! the facts the registry knows; a rule's `:when` may use no binders.
 //!
 //! Every error names the node it is about. Top-level forms are checked
 //! independently, so one load reports every rule that is wrong.
@@ -33,6 +33,7 @@ use std::fmt;
 
 use crate::cond::{self, Cond, Scope};
 use crate::elaborate::{Arity, Declaration, InnerSpec, OptionSpec};
+use crate::facts::Facts;
 use crate::pattern::{Pattern, RedirectPattern, Token, Var};
 use crate::rules::{Kind, RuleName};
 use crate::segment::RedirectKind;
@@ -174,8 +175,12 @@ fn err<T>(
 
 const EXPECTED_FORM: &str = "expected (rule ...) or (command ...)";
 
-/// Check every top-level form. All the errors, or the table.
-pub fn parse(forms: &[Node]) -> Result<File, Vec<TypeError>> {
+/// Check every top-level form, naming only facts in `facts`. All the
+/// errors, or the table.
+pub fn parse(
+  forms: &[Node],
+  facts: &Facts,
+) -> Result<File, Vec<TypeError>> {
   let mut file = File {
     rules: Vec::new(),
     commands: Vec::new(),
@@ -183,7 +188,7 @@ pub fn parse(forms: &[Node]) -> Result<File, Vec<TypeError>> {
   let mut errors = Vec::new();
   for form in forms {
     let result = match head_symbol(form) {
-      Some("rule") => parse_rule(form).map(|rule| file.rules.push(rule)),
+      Some("rule") => parse_rule(form, facts).map(|rule| file.rules.push(rule)),
       Some("command") => parse_command(form).map(|decl| file.commands.push(decl)),
       Some(other) => err(
         form_head(form).span,
@@ -222,7 +227,10 @@ fn form_head(form: &Node) -> &Node {
   }
 }
 
-fn parse_rule(form: &Node) -> Result<Rule, TypeError> {
+fn parse_rule(
+  form: &Node,
+  facts: &Facts,
+) -> Result<Rule, TypeError> {
   let Sx::List(items) = &form.kind else {
     return err(form.span, EXPECTED_FORM);
   };
@@ -249,12 +257,12 @@ fn parse_rule(form: &Node) -> Result<Rule, TypeError> {
         if when.is_some() {
           return err(item.span, "`:when` given twice");
         }
-        when = Some(cond::parse(value, &Scope::Rule)?);
+        when = Some(cond::parse(value, &Scope::Rule, facts)?);
         i += 2;
       }
       Sx::Keyword(key) => return err(item.span, format!("unknown keyword `:{key}` in rule")),
       Sx::List(_) => {
-        rows.push(parse_row(item)?);
+        rows.push(parse_row(item, facts)?);
         i += 1;
       }
       _ => {
@@ -276,7 +284,10 @@ fn parse_rule(form: &Node) -> Result<Rule, TypeError> {
   })
 }
 
-fn parse_row(node: &Node) -> Result<Row, TypeError> {
+fn parse_row(
+  node: &Node,
+  facts: &Facts,
+) -> Result<Row, TypeError> {
   let Sx::List(items) = &node.kind else {
     return err(
       node.span,
@@ -319,7 +330,7 @@ fn parse_row(node: &Node) -> Result<Row, TypeError> {
       return err(item.span, format!("`:{key}` needs a value"));
     };
     match key.as_str() {
-      "when" => set_once(&mut when, item, cond::parse(value, &scope)?)?,
+      "when" => set_once(&mut when, item, cond::parse(value, &scope, facts)?)?,
       "reason" => set_once(&mut reason, item, string(item, value)?)?,
       "instead" => set_once(&mut instead, item, string(item, value)?)?,
       other => {
@@ -739,12 +750,16 @@ fn binder(
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::facts::Arg;
   use crate::pattern::Bindings;
   use crate::segment;
   use crate::sexp;
 
   fn parse_text(source: &str) -> Result<File, Vec<TypeError>> {
-    parse(&sexp::read_all(source).unwrap_or_else(|e| panic!("read: {e}")))
+    parse(
+      &sexp::read_all(source).unwrap_or_else(|e| panic!("read: {e}")),
+      &Facts::builtin(),
+    )
   }
 
   fn file(source: &str) -> File {
@@ -841,14 +856,20 @@ mod tests {
   #[test]
   fn a_rule_condition_is_checked_with_no_binders() {
     let file = file(TABLE);
-    assert_eq!(file.rules[1].when, Some(Cond::AncestorHas(".jj".into())));
+    assert_eq!(
+      file.rules[1].when,
+      Some(Cond::Fact {
+        name: "ancestor-has?".into(),
+        args: vec![Arg::Literal(".jj".into())],
+      })
+    );
     assert_eq!(
       error("(rule x :when (under? ?p \"/tmp\") (deny [a ?p] :reason \"r\" :instead \"i\"))"),
       "1:23: `?p` is not bound: a rule `:when` runs before any pattern matches"
     );
     assert_eq!(
       error("(rule x :when (nope) (deny [a] :reason \"r\" :instead \"i\"))"),
-      "1:16: unknown predicate `nope`"
+      "1:16: unknown fact `nope`"
     );
   }
 
@@ -879,10 +900,10 @@ mod tests {
     let row = &table.rules[2].rows[0];
     assert_eq!(
       row.when,
-      Some(Cond::Under(
-        cond::Arg::Var(Var::from("out")),
-        std::path::PathBuf::from("/tmp")
-      ))
+      Some(Cond::Fact {
+        name: "under?".into(),
+        args: vec![Arg::Var(Var::from("out")), Arg::Literal("/tmp".into())],
+      })
     );
     // Binders come from words, redirect targets, and tool paths.
     file(
