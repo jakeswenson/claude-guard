@@ -53,6 +53,6 @@ Every rule the matcher, the conditions, and the elaborator follow has a `check` 
        asks "git stash" :facts ((u? unknown "timed out")))
 ```
 
-No check touches the disk: `:ancestors` stands in for `ancestor-has?` with a list, and `:facts` stands in any fact by name with a fixed answer, which is how the spec states what a timed-out fact does before one exists. A rule check runs one rule through the real engine against one command, so the engine's behavior on an unknown is a spec line too.
+No check touches the disk or starts a process: `:ancestors` stands in for `ancestor-has?` with a list, and `:facts` stands in any fact by name with a fixed answer, or an answer for one argument list only, which is how the spec states what a declared fact does without running one. A rule check runs one rule through the real engine against one command, so the engine's behavior on an unknown is a spec line too, and its `:asked` list states what the evaluation asked, in order, which is what the log record carries. `spec/facts.scm` holds the fact lines; the stdio protocol itself is tested in Rust with `sh`.
 
 A behavior without a check line does not exist. Changing the logic means adding a line, watching it fail, and making it pass, which is the same loop as the code, and the spec cannot go stale because it is what the tests run.

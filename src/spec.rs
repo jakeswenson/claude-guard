@@ -8,13 +8,16 @@
 //!        | (check (cond) holds|fails|unknown ["reason"]
 //!                 [:with <pairs>] [:cwd "path"] [:ancestors <fs>] [:facts (<stub>...)])
 //!        | (check (rule ...) denies|asks|warns|passes "command" ["text"]
-//!                 [:cwd "path"] [:ancestors <fs>] [:facts (<stub>...)])
+//!                 [:cwd "path"] [:ancestors <fs>] [:facts (<stub>...)] [:asked (<call>...)])
 //! decls := :commands ((command ...) ...)   ; declarations in force for this check
 //! set   := (?name "word")*            ; one binding set, as pairs
 //!        | ((?name "word")*)+         ; several sets, each in its own list
 //! fs    := ("name" ...)               ; entries an ancestor of cwd has; the rest do not
 //!        | unknown                    ; ancestor-has? answers unknown
-//! stub  := (<name> holds|fails|unknown ["reason"])   ; a fact and its fixed answer
+//! stub  := (<name> holds|fails|unknown ["reason"] [:args ("..." ...)])
+//!                                     ; a fact and its fixed answer; with :args, that
+//!                                     ; answer only for those arguments, else a fail
+//! call  := (<name> "arg"...)          ; one fact the evaluation asked, with its arguments
 //! ```
 //!
 //! A command must segment to one simple command. `binds` passes when the
@@ -24,9 +27,11 @@
 //! facts are the built-ins with `:ancestors` and `:facts` stood in by
 //! name, so no check touches the disk. A `"reason"` after the verb must
 //! equal the answer's reason. A rule check runs one rule through the
-//! engine against one Bash command with the same stand-ins, and its
-//! `"text"` must equal the rendered decision. An `elaborates` check
-//! compares against the notation [`show`] renders.
+//! engine against one Bash command with the same stand-ins; its `"text"`
+//! must equal the rendered decision, and its `:asked` list must equal
+//! what the evaluation asked, in order, which is what the log record
+//! carries. An `elaborates` check compares against the notation
+//! [`show`] renders.
 //!
 //! Files under `spec/` are the spec. Every failing check prints as
 //! `file:line:col: message`, and the test fails once at the end with the
@@ -40,7 +45,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cond::{self, Cond, Scope};
 use crate::elaborate::{Declarations, Elaborated, Inner, Part};
-use crate::facts::{Ancestors, Answer, Call, Facts, Stub, Truth};
+use crate::facts::{Ancestors, Answer, ArgStub, Call, Facts, Stub, Truth};
 use crate::input::{HookInput, Tool};
 use crate::load::Source;
 use crate::output::Decision;
@@ -528,19 +533,81 @@ fn declare_stub(
     return err(name.span, "a stubbed fact's name is a symbol");
   };
   let truth = truth_verb(verb, "stub")?;
-  let reason = match rest {
-    [] => None,
-    [node] => match &node.kind {
-      Sx::Str(reason) => Some(reason.clone()),
-      _ => return err(node.span, "a stub's reason is a string"),
-    },
-    [_, extra, ..] => return err(extra.span, format!("unexpected `{extra}`")),
+  let (reason, rest) = match rest {
+    [node, rest @ ..] if matches!(&node.kind, Sx::Str(_)) => {
+      let Sx::Str(reason) = &node.kind else {
+        unreachable!("matched a string");
+      };
+      (Some(reason.clone()), rest)
+    }
+    rest => (None, rest),
   };
   if truth == Truth::Unknown && reason.is_none() {
     return err(verb.span, "an unknown stub needs a reason");
   }
-  facts.declare(name.as_str(), Stub(Answer { truth, reason }));
+  let answer = Answer { truth, reason };
+  match rest {
+    [] => facts.declare(name.as_str(), Stub(answer)),
+    [key, value] if matches!(&key.kind, Sx::Keyword(k) if k == "args") => {
+      let args = string_list(value, "`:args` takes a list of strings")?;
+      facts.declare(name.as_str(), ArgStub { args, answer });
+    }
+    [extra, ..] => {
+      return err(
+        extra.span,
+        format!("unexpected `{extra}`; a stub ends with an optional :args (\"...\" ...)"),
+      );
+    }
+  }
   Ok(())
+}
+
+/// A list of strings, or `message` at the offending node.
+fn string_list(
+  node: &Node,
+  message: &str,
+) -> Result<Vec<String>, TypeError> {
+  let Sx::List(items) = &node.kind else {
+    return err(node.span, message);
+  };
+  items
+    .iter()
+    .map(|item| match &item.kind {
+      Sx::Str(s) => Ok(s.clone()),
+      _ => err(item.span, message),
+    })
+    .collect()
+}
+
+/// `(<name> "arg"...)` forms: what a rule check expects the evaluation
+/// to have asked, in order.
+fn asked_list(node: &Node) -> Result<Vec<(String, Vec<String>)>, TypeError> {
+  const EXPECTED: &str = "`:asked` takes a list of (name \"arg\"...) forms";
+  let Sx::List(items) = &node.kind else {
+    return err(node.span, EXPECTED);
+  };
+  items
+    .iter()
+    .map(|item| {
+      let Sx::List(parts) = &item.kind else {
+        return err(item.span, EXPECTED);
+      };
+      let Some((name, args)) = parts.split_first() else {
+        return err(item.span, EXPECTED);
+      };
+      let Sx::Symbol(name) = &name.kind else {
+        return err(name.span, EXPECTED);
+      };
+      let args = args
+        .iter()
+        .map(|arg| match &arg.kind {
+          Sx::Str(s) => Ok(s.clone()),
+          _ => err(arg.span, EXPECTED),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+      Ok((name.clone(), args))
+    })
+    .collect()
 }
 
 /// The world a condition or rule check runs in: the binding set, the
@@ -549,6 +616,8 @@ struct Setup {
   bindings: Bindings,
   cwd: String,
   facts: Facts,
+  /// What a rule check expects the evaluation to have asked, in order.
+  asked: Option<Vec<(String, Vec<String>)>>,
 }
 
 /// An optional `"text"` right after the verb, and the arguments after it.
@@ -562,9 +631,10 @@ fn leading_string(args: &[Node]) -> (Option<&str>, &[Node]) {
   }
 }
 
-/// Read `:with`, `:cwd`, `:ancestors`, and `:facts`. `:with` is refused
-/// when `with_allowed` is false, since a rule check binds from its own
-/// pattern.
+/// Read `:with`, `:cwd`, `:ancestors`, `:facts`, and `:asked`. `:with`
+/// is refused when `with_allowed` is false, since a rule check binds
+/// from its own pattern; `:asked` is only for rule checks, since only an
+/// evaluation asks.
 fn setup(
   args: &[Node],
   with_allowed: bool,
@@ -572,10 +642,11 @@ fn setup(
   let expected_keywords = if with_allowed {
     ":with, :cwd, :ancestors, or :facts"
   } else {
-    ":cwd, :ancestors, or :facts"
+    ":cwd, :ancestors, :facts, or :asked"
   };
   let mut bindings = Bindings::new();
   let mut cwd = String::from("/spec");
+  let mut asked = None;
   let mut facts = Facts::builtin();
   facts.declare(
     "ancestor-has?",
@@ -607,6 +678,13 @@ fn setup(
         return err(
           key.span,
           "`:with` is for condition checks; a rule check binds from its own pattern",
+        );
+      }
+      "asked" if !with_allowed => asked = Some(asked_list(value)?),
+      "asked" => {
+        return err(
+          key.span,
+          "`:asked` is for rule checks; only an evaluation asks facts",
         );
       }
       "cwd" => {
@@ -659,7 +737,24 @@ fn setup(
     bindings,
     cwd,
     facts,
+    asked,
   })
+}
+
+/// `(a? "x") (b?)`: asked facts in the spec's notation.
+fn show_asked(asked: &[(String, Vec<String>)]) -> String {
+  if asked.is_empty() {
+    return "nothing".into();
+  }
+  asked
+    .iter()
+    .map(|(name, args)| {
+      let mut parts = vec![name.clone()];
+      parts.extend(args.iter().map(|a| format!("{a:?}")));
+      format!("({})", parts.join(" "))
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 fn check_cond(
@@ -680,6 +775,7 @@ fn check_cond(
     bindings,
     cwd,
     facts,
+    asked: _,
   } = setup(args, true)?;
 
   let scope = Scope::Row(bindings.keys().cloned().collect());
@@ -733,7 +829,12 @@ fn check_rule(
     return err(command_node.span, "expected a command string");
   };
   let (expected_text, args) = leading_string(args);
-  let Setup { cwd, facts, .. } = setup(args, false)?;
+  let Setup {
+    cwd,
+    facts,
+    asked: expected_asked,
+    ..
+  } = setup(args, false)?;
 
   let file =
     syntax::parse(std::slice::from_ref(subject), &facts).map_err(|mut errors| errors.remove(0))?;
@@ -752,6 +853,11 @@ fn check_rule(
   );
   let rules = Ruleset::assemble(Source::Builtin, declarations, facts, file.rules);
   let verdict = rules.evaluate(&ctx);
+  let asked: Vec<(String, Vec<String>)> = rules
+    .facts_asked()
+    .into_iter()
+    .map(|a| (a.name.to_string(), a.args))
+    .collect();
 
   let (got, text) = match &verdict {
     None => (None, None),
@@ -785,6 +891,18 @@ fn check_rule(
         Some(text) => format!("expected text {wanted:?}, got {text:?}"),
         None => format!("expected text {wanted:?}, got a pass"),
       },
+    );
+  }
+  if let Some(wanted) = expected_asked
+    && asked != wanted
+  {
+    return err(
+      form.span,
+      format!(
+        "expected asked {}, got {}",
+        show_asked(&wanted),
+        show_asked(&asked)
+      ),
     );
   }
   Ok(())
@@ -935,6 +1053,64 @@ mod tests {
   fn a_condition_check_defaults_to_no_bindings_an_empty_fs_and_a_cwd() {
     passes("(check (ancestor-has? \".jj\") fails)");
     passes("(check (under? \"x\" \"/spec\") holds)");
+  }
+
+  #[test]
+  fn a_stub_can_answer_for_one_argument_list_only() {
+    passes("(check (f? \"a\" \"b\") holds :facts ((f? holds :args (\"a\" \"b\"))))");
+    passes(
+      "(check (f? \"a\") fails \"asked with [\\\"a\\\"], not [\\\"a\\\", \\\"b\\\"]\" :facts ((f? holds :args (\"a\" \"b\"))))",
+    );
+    passes("(check (f?) unknown \"f? is unknown: slow\" :facts ((f? unknown \"slow\" :args ())))");
+    assert_eq!(
+      failures("(check (f?) holds :facts ((f? holds :args x)))"),
+      ["t.scm:1:43: `:args` takes a list of strings"]
+    );
+    assert_eq!(
+      failures("(check (f?) holds :facts ((f? holds :args (\"a\" b))))"),
+      ["t.scm:1:48: `:args` takes a list of strings"]
+    );
+    assert_eq!(
+      failures("(check (f?) holds :facts ((f? holds :arg (\"a\"))))"),
+      ["t.scm:1:37: unexpected `:arg`; a stub ends with an optional :args (\"...\" ...)"]
+    );
+  }
+
+  #[test]
+  fn a_rule_check_can_say_what_the_evaluation_asked() {
+    const RULE: &str =
+      "(rule r :when (a?) (deny [x ?p] :when (and (b? ?p) (a?)) :reason \"r.\" :instead \"i.\"))";
+    let stubs = ":facts ((a? holds) (b? holds))";
+    passes(&format!(
+      "(check {RULE} denies \"x 1\" :asked ((a?) (b? \"1\")) {stubs})"
+    ));
+    // A memoized answer is not asked twice; nothing asked is `()`.
+    passes(&format!(
+      "(check {RULE} passes \"y\" :asked ((a?)) {stubs})"
+    ));
+    passes("(check (rule r (deny [x] :reason \"r.\" :instead \"i.\")) denies \"x\" :asked ())");
+    assert_eq!(
+      failures(&format!(
+        "(check {RULE} denies \"x 1\" :asked ((b? \"1\")) {stubs})"
+      )),
+      ["t.scm:1:1: expected asked (b? \"1\"), got (a?) (b? \"1\")"]
+    );
+    assert_eq!(
+      failures(
+        "(check (rule r (deny [x] :reason \"r.\" :instead \"i.\")) denies \"x\" :asked ((a?)))"
+      ),
+      ["t.scm:1:1: expected asked (a?), got nothing"]
+    );
+    assert_eq!(
+      failures(
+        "(check (rule r (deny [x] :reason \"r.\" :instead \"i.\")) denies \"x\" :asked (a?))"
+      ),
+      ["t.scm:1:74: `:asked` takes a list of (name \"arg\"...) forms"]
+    );
+    assert_eq!(
+      failures("(check (a?) holds :facts ((a? holds)) :asked ((a?)))"),
+      ["t.scm:1:39: `:asked` is for rule checks; only an evaluation asks facts"]
+    );
   }
 
   #[test]

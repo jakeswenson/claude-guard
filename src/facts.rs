@@ -33,7 +33,7 @@ use std::time::Instant;
 pub use ancestor_has::AncestorHas;
 pub use exec::Exec;
 use serde::{Deserialize, Serialize};
-pub use stubs::{Ancestors, Stub};
+pub use stubs::{Ancestors, ArgStub, Stub};
 pub use under::Under;
 
 use crate::input::{SessionId, ToolName, string_id};
@@ -255,6 +255,11 @@ impl Facts {
     name: &FactName,
   ) -> Option<&dyn Fact> {
     self.by_name.get(name).map(|fact| fact.as_ref())
+  }
+
+  /// Every name the registry knows, in order.
+  pub fn names(&self) -> impl Iterator<Item = &FactName> {
+    self.by_name.keys()
   }
 
   /// Ask a fact by name, once per fact, arguments, and cwd. An unknown

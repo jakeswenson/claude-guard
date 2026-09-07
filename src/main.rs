@@ -40,7 +40,8 @@ const USAGE: &str = "usage: claude-guard <hook|session-start>  (reads hook JSON 
                      claude-guard rules [--export]     (check the rules in force, or print the built-in file)\n       \
                      claude-guard commands             (which programs the sessions run, and what the guard knows)\n       \
                      claude-guard commands add [--force] [--stdout] <name>...  (declare a program from carapace)\n       \
-                     claude-guard elaborate --check-log (round-trip every logged command through the elaborator)";
+                     claude-guard elaborate --check-log (round-trip every logged command through the elaborator)\n       \
+                     claude-guard extern <fact> [arg]...  (ask one fact the way the hook would; hook JSON on stdin, or this directory)";
 
 fn main() -> ExitCode {
   fail_open(|| {
@@ -50,24 +51,31 @@ fn main() -> ExitCode {
   })
 }
 
-/// The guard never blocks a session by accident. Whatever happens inside
-/// `work`, the process exits 0 and stdout is left alone, so Claude Code
-/// falls through to its normal permission rules.
+/// The guard never blocks a session by accident. Whatever goes wrong
+/// inside `work`, the process exits 0 and stdout is left alone, so Claude
+/// Code falls through to its normal permission rules. Only a subcommand
+/// that ran to completion chooses its own exit code, and the hook's is
+/// always 0.
 ///
-/// - `Ok(())`: nothing to add.
+/// - `Ok(code)`: the subcommand's own answer.
 /// - `Err(report)`: one line on stderr with the full cause chain. The
 ///   report's `Debug` form would add the span trace, but it spans many
 ///   lines and the spec asks for one.
 /// - panic: color-eyre's hook has already printed its report by the time
 ///   the unwind reaches this frame. One more line says the call went
 ///   through, so a reader of the debug log is not left guessing.
-fn fail_open(work: impl FnOnce() -> Result<()>) -> ExitCode {
+fn fail_open(work: impl FnOnce() -> Result<ExitCode>) -> ExitCode {
   match panic::catch_unwind(AssertUnwindSafe(work)) {
-    Ok(Ok(())) => {}
-    Ok(Err(report)) => eprintln!("claude-guard: failed open: {}", chain(&report)),
-    Err(_) => eprintln!("claude-guard: failed open after a panic; tool call proceeds"),
+    Ok(Ok(code)) => code,
+    Ok(Err(report)) => {
+      eprintln!("claude-guard: failed open: {}", chain(&report));
+      ExitCode::SUCCESS
+    }
+    Err(_) => {
+      eprintln!("claude-guard: failed open after a panic; tool call proceeds");
+      ExitCode::SUCCESS
+    }
   }
-  ExitCode::SUCCESS
 }
 
 /// The full cause chain on one line, outermost first.
@@ -80,8 +88,8 @@ fn chain(report: &color_eyre::Report) -> String {
 }
 
 /// Dispatch on the subcommand. The hook subcommands read stdin once;
-/// `rules` never touches it.
-fn run(args: &[String]) -> Result<()> {
+/// `rules` never touches it. Every subcommand but `extern` exits 0.
+fn run(args: &[String]) -> Result<ExitCode> {
   let Some((subcommand, rest)) = args.split_first() else {
     eprintln!("{USAGE}");
     bail!("no subcommand given");
@@ -93,11 +101,92 @@ fn run(args: &[String]) -> Result<()> {
     "rules" => rules_command(rest),
     "commands" => commands_command(rest),
     "elaborate" => elaborate_command(rest),
+    "extern" => return extern_command(rest),
     other => {
       eprintln!("{USAGE}");
       bail!("unknown subcommand {other:?}");
     }
+  }?;
+  Ok(ExitCode::SUCCESS)
+}
+
+/// `extern <fact> [arg]...` asks one fact the way the hook would and
+/// prints what it answered and how long it took. The call comes from a
+/// hook payload on stdin, or, when stdin is a terminal or empty, from
+/// this directory with no session behind it. The exit code is the
+/// answer: 0 holds, 1 fails, 2 unknown, 3 the fact could not be asked at
+/// all. Stderr passes through from the program, so a script author sees
+/// its own diagnostics.
+fn extern_command(args: &[String]) -> Result<ExitCode> {
+  let Some((name, fact_args)) = args.split_first() else {
+    eprintln!("{USAGE}");
+    bail!("`extern` needs a fact name");
+  };
+  let rules = match rules::Ruleset::load() {
+    Ok(rules) => rules,
+    Err(e) => {
+      eprintln!("{e}");
+      return Ok(ExitCode::from(3));
+    }
+  };
+  let name = facts::FactName::from(name.as_str());
+  if rules.facts.get(&name).is_none() {
+    let known = rules
+      .facts
+      .names()
+      .map(ToString::to_string)
+      .collect::<Vec<_>>()
+      .join(", ");
+    eprintln!("claude-guard: no fact named `{name}`; the rules in force know: {known}");
+    return Ok(ExitCode::from(3));
   }
+
+  let input = match hook_input_on_stdin()? {
+    Some(input) => input,
+    None => input::HookInput {
+      session_id: "extern".into(),
+      cwd: std::env::current_dir()
+        .wrap_err("find the current directory")?
+        .into(),
+      tool_use_id: "extern".into(),
+      agent_id: None,
+      tool: input::Tool::Other {
+        name: "none".into(),
+        input: serde_json::Value::Null,
+      },
+    },
+  };
+  let ctx = rules::Context::new(input, &rules.declarations);
+  let call = rules::Ruleset::call_for(&ctx);
+  let args: Vec<&str> = fact_args.iter().map(String::as_str).collect();
+  let answer = rules.facts.ask(&name, &args, &call);
+  let ms = rules.facts_asked().last().map_or(0, |asked| asked.ms);
+
+  let (verdict, code) = match answer.truth {
+    facts::Truth::True => (format!("{name} holds"), 0),
+    facts::Truth::False => (format!("{name} fails"), 1),
+    // The registry already named the fact in an unknown's reason.
+    facts::Truth::Unknown => (String::new(), 2),
+  };
+  match (verdict.is_empty(), answer.reason) {
+    (true, reason) => println!("{} ({ms}ms)", reason.unwrap_or_default()),
+    (false, Some(reason)) => println!("{verdict}: {reason} ({ms}ms)"),
+    (false, None) => println!("{verdict} ({ms}ms)"),
+  }
+  Ok(ExitCode::from(code))
+}
+
+/// A hook payload on stdin, or `None` when stdin is a terminal or holds
+/// nothing, so `extern` can be typed at a prompt without a payload.
+fn hook_input_on_stdin() -> Result<Option<input::HookInput>> {
+  if std::io::stdin().is_terminal() {
+    return Ok(None);
+  }
+  let text = stdin()?;
+  if text.trim().is_empty() {
+    return Ok(None);
+  }
+  input::parse(&text).map(Some)
 }
 
 fn stdin() -> Result<String> {
@@ -398,8 +487,9 @@ mod tests {
   use color_eyre::eyre::eyre;
 
   #[test]
-  fn ok_exits_zero() {
-    assert_eq!(fail_open(|| Ok(())), ExitCode::SUCCESS);
+  fn ok_exits_with_the_code_the_work_chose() {
+    assert_eq!(fail_open(|| Ok(ExitCode::SUCCESS)), ExitCode::SUCCESS);
+    assert_eq!(fail_open(|| Ok(ExitCode::from(2))), ExitCode::from(2));
   }
 
   #[test]

@@ -68,13 +68,13 @@ cargo fmt                      # rustfmt config: 2 spaces, vertical fn params
 cargo install --path .         # a dev build into ~/.cargo/bin; users get `cargo install claude-guard`
 ```
 
-Tests never touch the real state or config directories: set `CLAUDE_GUARD_STATE_DIR`, `CLAUDE_GUARD_RULES`, and `CLAUDE_GUARD_COMMANDS_DIR` to temp dirs, as `tests/cli.rs` does. `spec/*.scm` holds `check` forms run by `spec::tests::the_spec_passes`; every matcher, condition, and elaborator behavior has a line there. `tests/fixtures/commands.jsonl` is a corpus of real logged commands for the elaborator's round-trip test.
+Tests never touch the real state or config directories: set `CLAUDE_GUARD_STATE_DIR`, `CLAUDE_GUARD_RULES`, and `CLAUDE_GUARD_COMMANDS_DIR` to temp dirs, as `tests/cli.rs` does. `spec/*.scm` holds `check` forms run by `spec::tests::the_spec_passes`; every matcher, condition, elaborator, engine, and fact behavior has a line there, and no check touches the disk or starts a process (`:ancestors`, `:facts`, and `:asked` stand in). The stdio protocol of a declared fact is tested in Rust with `sh -c` scripts. `tests/fixtures/commands.jsonl` is a corpus of real logged commands for the elaborator's round-trip test.
 
 ## Architecture Overview
 
 One binary, flat modules, no `mod.rs`. A hook call flows top to bottom:
 
-- `main.rs`: subcommand dispatch, the fail-open wrapper (exit 0 always, one stderr line on failure), tracing setup.
+- `main.rs`: subcommand dispatch, the fail-open wrapper (exit 0 on any failure, one stderr line), tracing setup; `extern` asks one fact by hand and is the one subcommand whose exit code is its answer.
 - `input.rs`: the hook payload as typed structs; the `string_id!` newtypes (`SessionId`, `ToolUseId`, `RuleName`, ...); tool inputs as a `Tool` enum.
 - `segment.rs`: a Bash command to simple commands via brush-parser: words after quote removal, literal or dynamic, plus file redirects; `$(...)` text is reported as uninspected.
 - `elaborate.rs`: a simple command classified under a declaration: name, options with values, args, subcommand path, inner command or script. A partition of the words; `flatten` returns the input.

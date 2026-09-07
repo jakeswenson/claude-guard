@@ -202,6 +202,18 @@ impl Ruleset {
     self.facts.take_asked()
   }
 
+  /// What a fact sees for this call: the cwd, the session, the tool, and
+  /// the term, which is the log's subject as JSON. The hook and
+  /// `claude-guard extern` build it the same way.
+  pub fn call_for(ctx: &Context) -> Call<'_> {
+    Call {
+      cwd: ctx.input.cwd.as_ref(),
+      session_id: ctx.input.session_id.clone(),
+      tool: ctx.input.tool.name(),
+      term: serde_json::to_value(log::Subject::of(ctx)).unwrap_or(serde_json::Value::Null),
+    }
+  }
+
   /// First opinion wins. `None` means the call proceeds untouched.
   pub fn evaluate(
     &self,
@@ -222,12 +234,7 @@ impl Ruleset {
       });
     }
 
-    let call = Call {
-      cwd: ctx.input.cwd.as_ref(),
-      session_id: ctx.input.session_id.clone(),
-      tool: ctx.input.tool.name(),
-      term: serde_json::to_value(log::Subject::of(ctx)).unwrap_or(serde_json::Value::Null),
-    };
+    let call = Ruleset::call_for(ctx);
     for rule in &self.rules {
       // The rule's `:when`: an unknown to carry to a matching row, or
       // the reasons it held with.

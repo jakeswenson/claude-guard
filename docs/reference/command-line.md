@@ -9,11 +9,12 @@ claude-guard commands                which programs the sessions run, and what t
 claude-guard commands add [--force] [--stdout] <name>...
                                      write a declaration for each program from carapace
 claude-guard elaborate --check-log   round-trip every logged command through the elaborator
+claude-guard extern <fact> [arg]...  ask one fact the way the hook would
 ```
 
 ## Exit code
 
-Always 0. The guard never blocks a session by exiting non-zero. A failure of any kind is one line on stderr, prefixed `claude-guard: failed open:`, and the tool call proceeds.
+0 for every subcommand but `extern`, which exits with the fact's answer. The guard never blocks a session by exiting non-zero. A failure of any kind is one line on stderr, prefixed `claude-guard: failed open:`, and the tool call proceeds.
 
 ## Subcommands
 
@@ -42,6 +43,23 @@ For each name, runs `carapace <name> export`, converts the result to a `(command
 ### `elaborate --check-log`
 
 Segments and elaborates every Bash command in every session log under the declarations in force and prints each one whose words do not come back whole, then a summary line.
+
+### `extern <fact> [arg]...`
+
+Asks one fact, built in or declared in the rules in force, with the given arguments, the way the hook would: same environment variables, same stdin object, same timeout. The call comes from a hook payload on stdin; when stdin is a terminal or empty, the call is the current directory with session `extern` and no tool. One line on stdout says what the fact answered and how long it took:
+
+```
+in-jj-repo? holds: jj root is /Users/me/proj (14ms)
+in-jj-repo? fails (12ms)
+in-jj-repo? is unknown: timed out after 1s (1001ms)
+```
+
+The program's stderr passes through. The exit code is the answer: 0 holds, 1 fails, 2 unknown, 3 when the fact could not be asked because the rules did not load or no fact has that name.
+
+```
+echo '{"session_id":"t","cwd":"/Users/me/proj","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git stash"},"tool_use_id":"t1"}' \
+  | claude-guard extern in-jj-repo?
+```
 
 ## Environment
 

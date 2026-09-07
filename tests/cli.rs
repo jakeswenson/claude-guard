@@ -288,6 +288,60 @@ fn a_declared_fact_runs_a_program_whose_answer_decides() {
 }
 
 #[test]
+fn extern_asks_one_fact_by_hand_and_exits_with_its_answer() {
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  fs::write(
+    &rules,
+    r#"
+      (fact managed? (exec "sh" "-c" "test \"$CLAUDE_GUARD_SESSION_ID\" = \"$1\" && echo '{\"holds\": true, \"reason\": \"session matched\"}' || echo '{\"holds\": false}'" "script")
+        :lifetime fresh :timeout "5s")
+      (fact slow? (exec "sh" "-c" "sleep 5") :lifetime fresh :timeout "200ms")
+      (fact loud? (exec "sh" "-c" "echo diagnostics >&2; echo '{\"holds\": false}'") :lifetime fresh :timeout "5s")
+      (rule r (deny [x] :when (managed? "abc123") :reason "r." :instead "i."))
+    "#,
+  )
+  .unwrap();
+  let run = |args: &[&str], stdin: &str| {
+    let mut command = guard_logging_to(state.path());
+    command.env("CLAUDE_GUARD_RULES", &rules);
+    command.current_dir(state.path());
+    command.arg("extern").args(args).write_stdin(stdin).assert()
+  };
+
+  // With a hook payload on stdin, the fact sees that call's session.
+  run(&["managed?", "abc123"], &bash_call_in(state.path(), "x"))
+    .code(0)
+    .stdout(predicate::str::is_match(r"^managed\? holds: session matched \(\d+ms\)\n$").unwrap());
+  // With nothing on stdin, the call is this directory with session `extern`.
+  run(&["managed?", "abc123"], "")
+    .code(1)
+    .stdout(predicate::str::is_match(r"^managed\? fails \(\d+ms\)\n$").unwrap());
+  run(&["managed?", "extern"], "").code(0);
+  // An unknown is exit 2 and names the fact.
+  run(&["slow?"], "").code(2).stdout(
+    predicate::str::is_match(r"^slow\? is unknown: timed out after 200ms \(\d+ms\)\n$").unwrap(),
+  );
+  // The program's stderr passes through.
+  run(&["loud?"], "")
+    .code(1)
+    .stderr(predicate::str::contains("diagnostics"));
+  // Built-ins can be asked too.
+  run(&["under?", "/tmp/x", "/tmp"], "").code(0);
+  // A fact the rules do not know is exit 3 with the known names.
+  run(&["nope?"], "")
+    .code(3)
+    .stdout("")
+    .stderr(predicate::str::contains(
+      "no fact named `nope?`; the rules in force know: ancestor-has?, loud?, managed?, slow?, under?",
+    ));
+  // No name is a usage error, and the hook's fail-open exit 0 applies.
+  run(&[], "")
+    .code(0)
+    .stderr(predicate::str::contains("needs a fact name"));
+}
+
+#[test]
 fn a_fact_declaration_that_does_not_load_fails_open_with_its_position() {
   let state = state_dir();
   let rules = state.path().join("rules.scm");

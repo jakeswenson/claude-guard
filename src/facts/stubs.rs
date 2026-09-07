@@ -28,6 +28,39 @@ impl Fact for Stub {
   }
 }
 
+/// One fixed answer for one argument list, and a fail naming what it was
+/// asked with for any other. How the spec states that a condition passed
+/// the arguments it meant to.
+pub struct ArgStub {
+  pub args: Vec<String>,
+  pub answer: Answer,
+}
+
+impl Fact for ArgStub {
+  fn check(
+    &self,
+    _args: &[(Arg, Span)],
+    _span: Span,
+  ) -> Result<(), TypeError> {
+    Ok(())
+  }
+
+  fn ask(
+    &self,
+    args: &[&str],
+    _call: &Call<'_>,
+  ) -> Answer {
+    if args == self.args {
+      self.answer.clone()
+    } else {
+      Answer {
+        truth: crate::facts::Truth::False,
+        reason: Some(format!("asked with {args:?}, not {:?}", self.args)),
+      }
+    }
+  }
+}
+
 /// `ancestor-has?` answered from a list: the entries some ancestor of
 /// cwd has; everything else does not exist. `unknown` makes every answer
 /// unknown, which is what a timed-out extern fact will do.
