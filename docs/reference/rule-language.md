@@ -116,7 +116,7 @@ When asked, the guard runs the program with:
  "args": ["/tmp/x"]}
 ```
 
-`subject` is the same value the log record carries for the call, keyed by tool; [the log format](log-format.md) lists its shapes. The program answers with one JSON object on stdout, `{"holds": true}` or `{"holds": false}`, with an optional `"reason"` string that becomes evidence. Fields it does not know are ignored. Stderr passes through to the hook's stderr.
+`subject` is the same value the log record carries for the call, keyed by tool; [the log format](log-format.md) lists its shapes. This is the object a `fresh` fact receives, because a `fresh` fact runs inside a call. A `session` lifetime, when it exists, will run at session start with no call to describe: `tool` and `subject` will be null there, and a fact that needs them cannot be `session`. The lifetime a fact declares decides what its program may see. The program answers with one JSON object on stdout, `{"holds": true}` or `{"holds": false}`, with an optional `"reason"` string that becomes evidence. Fields it does not know are ignored. Stderr passes through to the hook's stderr.
 
 The answer is unknown, with a reason, when the program cannot be started, exits non-zero, runs past `:timeout`, or prints anything but that object. The program runs in its own process group, and a timeout kills the whole group, so a script's children do not outlive the timeout. An unknown reads `<name> is unknown: <reason>` wherever it appears.
 

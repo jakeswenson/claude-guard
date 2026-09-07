@@ -19,6 +19,8 @@ The guard starts your program with:
 
 `subject` is what the rules saw, keyed by tool, the same value the log record carries; [the log format](../reference/log-format.md#subject) lists its shapes. A program that does not need it can ignore stdin.
 
+This is what a `fresh` fact sees, because it runs inside a call. Session-lifetime facts are not built yet; when they are, they will run at session start with `tool` and `subject` null, so a fact that reads the subject stays `fresh`.
+
 Your program writes one object to stdout and exits 0:
 
 ```json
