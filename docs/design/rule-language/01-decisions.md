@@ -193,6 +193,15 @@ arguments.
   reason. The reason is evidence (D10) and never changes a truth. The
   spec states each rule with `:facts` stubs and a `"reason"` after the
   verb. Made while implementing ADR 0003, 2026-09-07.
+- **D29** — An unknown names its fact. The registry prefixes every
+  unknown answer with the fact's name, `in-jj-repo? is unknown: timed
+  out after 1s`, so the evidence an ask carries (D14) says which fact
+  could not be settled without the engine knowing what a condition
+  contains. A fact's own reason follows the colon. The spec gained a
+  rule check, `(check (rule ...) denies|asks|warns|passes "command"
+  ["text"] ...)`, that runs one rule through the engine, so D14 and ADR
+  0001 have check lines in `spec/evaluation.scm`. Made while
+  implementing D14, 2026-09-07.
 
 ## Scope: first version
 

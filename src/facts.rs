@@ -184,17 +184,27 @@ impl Facts {
     self.by_name.get(name).map(|fact| fact.as_ref())
   }
 
-  /// Ask a fact by name. The parser refuses a name the registry does not
-  /// know, so the unknown here is a guard, not a path a loaded file takes.
+  /// Ask a fact by name. An unknown answer is prefixed with the fact's
+  /// name, `in-jj-repo? is unknown: timed out`, so the evidence an ask
+  /// carries says which fact could not be settled. The parser refuses a
+  /// name the registry does not know, so that unknown is a guard, not a
+  /// path a loaded file takes.
   pub fn ask(
     &self,
     name: &FactName,
     args: &[&str],
     call: &Call<'_>,
   ) -> Answer {
-    match self.get(name) {
-      Some(fact) => fact.ask(args, call),
-      None => Answer::unknown(format!("no fact named `{name}`")),
+    let Some(fact) = self.get(name) else {
+      return Answer::unknown(format!("no fact named `{name}`"));
+    };
+    let answer = fact.ask(args, call);
+    match answer.truth {
+      Truth::Unknown => Answer::unknown(format!(
+        "{name} is unknown: {}",
+        answer.reason.as_deref().unwrap_or("no reason given")
+      )),
+      Truth::True | Truth::False => answer,
     }
   }
 }
@@ -233,6 +243,33 @@ mod tests {
     assert_eq!(
       facts.ask(&FactName::from("exists?"), &[], &call(Path::new("/x"))),
       Answer::unknown("no fact named `exists?`")
+    );
+  }
+
+  #[test]
+  fn the_registry_names_the_fact_in_an_unknown() {
+    let mut facts = Facts::builtin();
+    facts.declare("slow?", Stub(Answer::unknown("timed out after 1s")));
+    facts.declare(
+      "mute?",
+      Stub(Answer {
+        truth: Truth::Unknown,
+        reason: None,
+      }),
+    );
+    facts.declare("yes?", Stub(Answer::holds().with_reason("as is")));
+    let cwd = Path::new("/x");
+    assert_eq!(
+      facts.ask(&FactName::from("slow?"), &[], &call(cwd)),
+      Answer::unknown("slow? is unknown: timed out after 1s")
+    );
+    assert_eq!(
+      facts.ask(&FactName::from("mute?"), &[], &call(cwd)),
+      Answer::unknown("mute? is unknown: no reason given")
+    );
+    assert_eq!(
+      facts.ask(&FactName::from("yes?"), &[], &call(cwd)),
+      Answer::holds().with_reason("as is")
     );
   }
 
@@ -369,8 +406,10 @@ mod tests {
       present: vec![".jj".into()],
       unknown: true,
     };
-    assert_eq!(unknown.ask(&[".jj"], &call(cwd)).truth, Truth::Unknown);
-    assert!(unknown.ask(&[".jj"], &call(cwd)).reason.is_some());
+    assert_eq!(
+      unknown.ask(&[".jj"], &call(cwd)),
+      Answer::unknown("stubbed as unknown")
+    );
     // The list stub checks arguments like the real fact.
     assert!(ancestors.check(&[], at(1, 1)).is_err());
     // A plain stub takes any arguments.

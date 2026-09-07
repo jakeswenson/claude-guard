@@ -70,14 +70,15 @@
 
 ;; --- reasons travel with the answer ---
 
-;; A fact's own reason comes through as is.
+;; A fact's own reason comes through as is. An unknown's names the fact,
+;; so the evidence an ask carries says which fact could not be settled.
 (check (a?) holds   "a held"    :facts ((a? holds "a held")))
-(check (u?) unknown "u timed out" :facts ((u? unknown "u timed out")))
+(check (u?) unknown "u? is unknown: u timed out" :facts ((u? unknown "u timed out")))
 
 ;; An unknown `and` or `or` carries the first unknown, in evaluation order.
-(check (and (a?) (u?) (v?)) unknown "u timed out"
+(check (and (a?) (u?) (v?)) unknown "u? is unknown: u timed out"
        :facts ((a? holds "a held") (u? unknown "u timed out") (v? unknown "v timed out")))
-(check (or (f?) (v?) (u?)) unknown "v timed out"
+(check (or (f?) (v?) (u?)) unknown "v? is unknown: v timed out"
        :facts ((f? fails "f failed") (u? unknown "u timed out") (v? unknown "v timed out")))
 
 ;; The part that settled it carries its reason: one false for an `and`,
@@ -96,4 +97,4 @@
 
 ;; `not` flips the truth and keeps the reason.
 (check (not (f?)) holds   "f failed"    :facts ((f? fails "f failed")))
-(check (not (u?)) unknown "u timed out" :facts ((u? unknown "u timed out")))
+(check (not (u?)) unknown "u? is unknown: u timed out" :facts ((u? unknown "u timed out")))

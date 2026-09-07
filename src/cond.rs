@@ -227,19 +227,49 @@ fn settled(
   }
 }
 
-/// The first binding set under which `cond` holds. With no condition,
-/// the first binding set. `None` when no candidate satisfies it, which
-/// includes every candidate coming back `Unknown`.
+/// What [`choose`] found among a pattern's binding sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Choice {
+  /// A binding set under which the condition holds.
+  Holds(Bindings),
+  /// No set holds, and this one came back unknown, with the reason. The
+  /// engine turns this into an ask (D14).
+  Unknown { bindings: Bindings, reason: String },
+  /// No set holds and none is unknown, or there were no sets at all.
+  NoMatch,
+}
+
+/// The first binding set under which `cond` holds; with no condition,
+/// the first binding set. When none holds, the first set that came back
+/// unknown, so a matched pattern with an unsettled condition is told
+/// apart from a pattern that did not match.
 pub fn choose(
   cond: Option<&Cond>,
   candidates: Vec<Bindings>,
   facts: &Facts,
   call: &Call<'_>,
-) -> Option<Bindings> {
-  candidates.into_iter().find(|bindings| match cond {
-    None => true,
-    Some(cond) => cond.eval(facts, call, bindings).truth == Truth::True,
-  })
+) -> Choice {
+  let Some(cond) = cond else {
+    return match candidates.into_iter().next() {
+      Some(bindings) => Choice::Holds(bindings),
+      None => Choice::NoMatch,
+    };
+  };
+  let mut unknown = None;
+  for bindings in candidates {
+    let answer = cond.eval(facts, call, &bindings);
+    match answer.truth {
+      Truth::True => return Choice::Holds(bindings),
+      Truth::Unknown if unknown.is_none() => {
+        unknown = Some(Choice::Unknown {
+          bindings,
+          reason: answer.reason.unwrap_or_else(|| "unknown".into()),
+        });
+      }
+      Truth::Unknown | Truth::False => {}
+    }
+  }
+  unknown.unwrap_or(Choice::NoMatch)
 }
 
 #[cfg(test)]
@@ -546,12 +576,18 @@ mod tests {
     facts.declare("t?", Stub(Answer::holds()));
     let go = |src: &str| eval_with(src, &facts, &Bindings::new());
 
-    // A fact's own reason.
+    // A fact's own reason; an unknown's names the fact.
     assert_eq!(go("(a?)"), Answer::holds().with_reason("a held"));
-    assert_eq!(go("(u?)"), Answer::unknown("u timed out"));
+    assert_eq!(go("(u?)"), Answer::unknown("u? is unknown: u timed out"));
     // The first unknown, in evaluation order.
-    assert_eq!(go("(and (a?) (u?) (v?))"), Answer::unknown("u timed out"));
-    assert_eq!(go("(or (f?) (v?) (u?))"), Answer::unknown("v timed out"));
+    assert_eq!(
+      go("(and (a?) (u?) (v?))"),
+      Answer::unknown("u? is unknown: u timed out")
+    );
+    assert_eq!(
+      go("(or (f?) (v?) (u?))"),
+      Answer::unknown("v? is unknown: v timed out")
+    );
     // The deciding part.
     assert_eq!(
       go("(and (a?) (u?) (f?))"),
@@ -573,7 +609,10 @@ mod tests {
     );
     // `not` flips the truth and keeps the reason.
     assert_eq!(go("(not (f?))"), Answer::holds().with_reason("f failed"));
-    assert_eq!(go("(not (u?))"), Answer::unknown("u timed out"));
+    assert_eq!(
+      go("(not (u?))"),
+      Answer::unknown("u? is unknown: u timed out")
+    );
   }
 
   // --- choosing a binding set ---
@@ -592,27 +631,58 @@ mod tests {
     let under_tmp = cond("(under? ?p \"/tmp\")");
     assert_eq!(
       choose(Some(&under_tmp), candidates.clone(), &facts, &call),
-      Some(bound(&[("p", "/tmp/a")]))
+      Choice::Holds(bound(&[("p", "/tmp/a")]))
     );
     assert_eq!(
       choose(None, candidates.clone(), &facts, &call),
-      Some(bound(&[("p", "/var/a")]))
+      Choice::Holds(bound(&[("p", "/var/a")]))
     );
     let under_etc = cond("(under? ?p \"/etc\")");
-    assert_eq!(choose(Some(&under_etc), candidates, &facts, &call), None);
-    assert_eq!(choose(None, vec![], &facts, &call), None);
+    assert_eq!(
+      choose(Some(&under_etc), candidates, &facts, &call),
+      Choice::NoMatch
+    );
+    assert_eq!(choose(None, vec![], &facts, &call), Choice::NoMatch);
   }
 
   #[test]
-  fn choose_skips_unknown_candidates() {
-    let facts = facts_with(&[], true);
+  fn choose_reports_the_first_unknown_when_no_set_holds() {
+    let mut facts = Facts::builtin();
+    facts.declare("u?", Stub(Answer::unknown("timed out")));
     let call = Call {
       cwd: Path::new("/x"),
     };
-    let unknown = cond("(ancestor-has? \"u\")");
+    let parse_with =
+      |src: &str| parse(&sexp::read_one(src).unwrap(), &scope(&["p"]), &facts).unwrap();
+    // Unknown alone.
+    let unknown = parse_with("(u?)");
     assert_eq!(
       choose(Some(&unknown), vec![Bindings::new()], &facts, &call),
-      None
+      Choice::Unknown {
+        bindings: Bindings::new(),
+        reason: "u? is unknown: timed out".into()
+      }
+    );
+    // A false set, then two unknown sets: the first unknown is reported.
+    let mixed = parse_with("(and (under? ?p \"/tmp\") (u?))");
+    let candidates = vec![
+      bound(&[("p", "/var/a")]),
+      bound(&[("p", "/tmp/a")]),
+      bound(&[("p", "/tmp/b")]),
+    ];
+    assert_eq!(
+      choose(Some(&mixed), candidates, &facts, &call),
+      Choice::Unknown {
+        bindings: bound(&[("p", "/tmp/a")]),
+        reason: "u? is unknown: timed out".into()
+      }
+    );
+    // A set that holds wins over every unknown, wherever it sits.
+    let either = parse_with("(or (u?) (under? ?p \"/tmp\"))");
+    let candidates = vec![bound(&[("p", "/var/a")]), bound(&[("p", "/tmp/a")])];
+    assert_eq!(
+      choose(Some(&either), candidates, &facts, &call),
+      Choice::Holds(bound(&[("p", "/tmp/a")]))
     );
   }
 }

@@ -71,9 +71,9 @@ Two facts exist:
 | `(ancestor-has? "name")` | the call's working directory or any directory above it contains an entry named `name` |
 | `(under? <arg> "prefix")` | the path, resolved against the working directory if relative and with `/private` stripped, is the prefix or below it by path component |
 
-Conditions are three-valued: true, false, unknown. `and`, `or`, and `not` follow Kleene's tables: one false settles an `and`, one true settles an `or`, `not` swaps true and false, and everything else that touches an unknown is unknown. Nothing produces unknown in this version; a fact that asks a program will.
+Conditions are three-valued: true, false, unknown. `and`, `or`, and `not` follow Kleene's tables: one false settles an `and`, one true settles an `or`, `not` swaps true and false, and everything else that touches an unknown is unknown. No shipped fact produces unknown in this version; a fact that asks a program will. What an unknown does to a rule is under [Evaluation](#evaluation).
 
-An answer carries a reason when the fact gave one. An unknown `and` or `or` carries the reason of its first unknown part, in evaluation order. A settled one carries the deciding part's reason, or every part's reasons joined with `; ` when all agreed. `not` keeps the reason and flips the truth. Reasons are evidence for the log and the deny text; they never change a decision.
+An answer carries a reason when the fact gave one. An unknown always carries one, prefixed with the fact's name: `in-jj-repo? is unknown: timed out after 1s`. An unknown `and` or `or` carries the reason of its first unknown part, in evaluation order. A settled one carries the deciding part's reason, or every part's reasons joined with `; ` when all agreed. `not` keeps the reason and flips the truth. Reasons are evidence for the log and the rendered text; they never change a truth.
 
 A binder in a row's condition must be declared by the row's pattern. A rule's `:when` runs before any pattern matches and may use no binders. Both are load errors.
 
@@ -82,13 +82,14 @@ A binder in a row's condition must be declared by the row's pattern. A rule's `:
 For one tool call:
 
 1. If the call is a Bash command the parser rejects, the answer is `ask` with the parser's message. Nothing else runs.
-2. Rules in file order. A rule whose `:when` does not hold is skipped whole. Within a rule, rows in order. A row fires when its subject matches and its condition holds under some binding set. The first firing row anywhere is the answer.
-3. If no row fired and the command held a `$(...)` or backquote substitution, the answer is `warn` naming the uninspected text.
-4. Otherwise the call passes and nothing is printed.
+2. Rules in file order. A rule whose `:when` is false is skipped whole; one whose `:when` is unknown has its rows tried. Within a rule, rows in order. A row fires when its subject matches and its condition holds under some binding set. The first firing row anywhere is the answer.
+3. A deny or ask row whose subject matched and whose condition, or whose rule's `:when`, is unknown answers `ask`, with the reason for the unknown in parentheses. A warn row in that position is skipped. Among several binding sets, one under which the condition holds wins over any unknown; with none holding, the first unknown set is the evidence. When both the rule's `:when` and the row's condition are unknown, the rule's reason is the evidence, since it ran first.
+4. If no row fired and the command held a `$(...)` or backquote substitution, the answer is `warn` naming the uninspected text.
+5. Otherwise the call passes and nothing is printed.
 
 A command pattern is tried against every simple command of the call, and then against what each carries: an inner command as is, an inner script segmented first, to a depth of eight. The outermost match wins. What was matched is what the deny text names.
 
-The rendered text is `claude-guard denied `<what>`: <reason> Instead: <instead>` for deny, `claude-guard asks about ...` for ask, and `claude-guard noted ...` for warn, with the `Instead:` clause absent when the row has none.
+The rendered text is `claude-guard denied `<what>`: <reason> Instead: <instead>` for deny, `claude-guard asks about ...` for ask, and `claude-guard noted ...` for warn, with the `Instead:` clause absent when the row has none. An ask caused by an unknown ends with the evidence in parentheses: `claude-guard asks about `git stash`: <reason> Instead: <instead> (in-jj-repo? is unknown: timed out after 1s)`. The evidence names the fact and gives the fact's own reason.
 
 ## Command declarations
 

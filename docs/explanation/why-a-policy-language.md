@@ -32,7 +32,7 @@ Combining unknowns follows Kleene's tables, the same ones SQL uses for `NULL`:
 | false | true | false | unknown |
 | unknown | true | unknown | unknown |
 
-`not` swaps true and false and leaves unknown alone. The two rows that matter for a guard: `false and unknown` is false, because one failed condition settles an `and` whatever the other says, and `true or unknown` is true for the same reason. Everything else that touches an unknown stays unknown, so a timed-out fact inside an `and` never turns into a silent pass. The design's next step turns "unknown on a matched pattern" into an ask that tells the model what was unknown, so it can remove the ambiguity itself.
+`not` swaps true and false and leaves unknown alone. The two rows that matter for a guard: `false and unknown` is false, because one failed condition settles an `and` whatever the other says, and `true or unknown` is true for the same reason. Everything else that touches an unknown stays unknown, so a timed-out fact inside an `and` never turns into a silent pass. And an unknown on a matched pattern is an ask, not a skip: the model sees which fact could not be settled and why, in parentheses after the rule's own reason, and can remove the ambiguity itself. A warn row in that position says nothing, because a warning with an unsettled premise is noise. The same holds one level up, for a rule whose own `:when` is unknown; [ADR 0001](../adrs/0001-unknown-rule-when-asks-on-match.md) has the reasoning.
 
 ## S-expressions
 
@@ -48,9 +48,11 @@ Every rule the matcher, the conditions, and the elaborator follow has a `check` 
 (check [git -... stash ...] misses  "git -C . stash")
 (check [git -... stash ...] matches "git -C . stash" :commands ((command git (option "-C" :value))))
 (check (and (ancestor-has? "t") (ancestor-has? "u")) unknown :ancestors unknown)
-(check (and (a?) (u?)) unknown "u timed out" :facts ((a? holds) (u? unknown "u timed out")))
+(check (and (a?) (u?)) unknown "u? is unknown: u timed out" :facts ((a? holds) (u? unknown "u timed out")))
+(check (rule r (deny [git stash] :when (u?) :reason "no." :instead "jj new."))
+       asks "git stash" :facts ((u? unknown "timed out")))
 ```
 
-A condition check never touches the disk: `:ancestors` stands in for `ancestor-has?` with a list, and `:facts` stands in any fact by name with a fixed answer, which is how the spec states what a timed-out fact does before one exists.
+No check touches the disk: `:ancestors` stands in for `ancestor-has?` with a list, and `:facts` stands in any fact by name with a fixed answer, which is how the spec states what a timed-out fact does before one exists. A rule check runs one rule through the real engine against one command, so the engine's behavior on an unknown is a spec line too.
 
 A behavior without a check line does not exist. Changing the logic means adding a line, watching it fail, and making it pass, which is the same loop as the code, and the spec cannot go stale because it is what the tests run.

@@ -51,7 +51,7 @@ impl Fact for Ancestors {
     _call: &Call<'_>,
   ) -> Answer {
     if self.unknown {
-      return Answer::unknown("ancestor-has? answered unknown");
+      return Answer::unknown("stubbed as unknown");
     }
     let [name] = args else {
       return Answer::unknown("ancestor-has? takes one name");

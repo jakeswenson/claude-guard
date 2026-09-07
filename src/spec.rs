@@ -7,6 +7,8 @@
 //!        | (check "command" elaborates (name item...) [decls])
 //!        | (check (cond) holds|fails|unknown ["reason"]
 //!                 [:with <pairs>] [:cwd "path"] [:ancestors <fs>] [:facts (<stub>...)])
+//!        | (check (rule ...) denies|asks|warns|passes "command" ["text"]
+//!                 [:cwd "path"] [:ancestors <fs>] [:facts (<stub>...)])
 //! decls := :commands ((command ...) ...)   ; declarations in force for this check
 //! set   := (?name "word")*            ; one binding set, as pairs
 //!        | ((?name "word")*)+         ; several sets, each in its own list
@@ -21,8 +23,10 @@
 //! it, so an unbound binder is a failure of the check, not a panic; its
 //! facts are the built-ins with `:ancestors` and `:facts` stood in by
 //! name, so no check touches the disk. A `"reason"` after the verb must
-//! equal the answer's reason. An `elaborates` check compares against the
-//! notation [`show`] renders.
+//! equal the answer's reason. A rule check runs one rule through the
+//! engine against one Bash command with the same stand-ins, and its
+//! `"text"` must equal the rendered decision. An `elaborates` check
+//! compares against the notation [`show`] renders.
 //!
 //! Files under `spec/` are the spec. Every failing check prints as
 //! `file:line:col: message`, and the test fails once at the end with the
@@ -37,7 +41,11 @@ use std::path::{Path, PathBuf};
 use crate::cond::{self, Cond, Scope};
 use crate::elaborate::{Declarations, Elaborated, Inner, Part};
 use crate::facts::{Ancestors, Answer, Call, Facts, Stub, Truth};
+use crate::input::{HookInput, Tool};
+use crate::load::Source;
+use crate::output::Decision;
 use crate::pattern::{Bindings, Pattern, Var};
+use crate::rules::{Context, Kind, Ruleset};
 use crate::segment::{self, RedirectKind, SimpleCommand, Word};
 use crate::sexp::{self, Kind as Sx, Node, Span};
 use crate::syntax::{self, Subject, TypeError};
@@ -159,7 +167,7 @@ fn run_check(form: &Node) -> Result<(), TypeError> {
   let Sx::Symbol(verb_name) = &verb.kind else {
     return err(
       verb.span,
-      "expected a verb: matches, misses, binds, holds, fails, unknown",
+      "expected a verb: matches, misses, binds, elaborates, holds, fails, unknown, denies, asks, warns, passes",
     );
   };
   match &subject.kind {
@@ -169,11 +177,14 @@ fn run_check(form: &Node) -> Result<(), TypeError> {
       };
       check_pattern(form, &pattern, verb, verb_name, args)
     }
+    Sx::List(items) if matches!(items.first().map(|n| &n.kind), Some(Sx::Symbol(s)) if s == "rule") => {
+      check_rule(form, subject, verb, verb_name, args)
+    }
     Sx::List(_) => check_cond(form, subject, verb, verb_name, args),
     Sx::Str(_) => check_elaboration(form, subject, verb, verb_name, args),
     _ => err(
       subject.span,
-      "expected a [pattern], a (condition), or a \"command\"",
+      "expected a [pattern], a (condition), a (rule ...), or a \"command\"",
     ),
   }
 }
@@ -532,31 +543,39 @@ fn declare_stub(
   Ok(())
 }
 
-fn check_cond(
-  form: &Node,
-  subject: &Node,
-  verb: &Node,
-  verb_name: &str,
-  args: &[Node],
-) -> Result<(), TypeError> {
-  let expected = match verb_name {
-    "holds" => Truth::True,
-    "fails" => Truth::False,
-    "unknown" => Truth::Unknown,
-    other => return err(verb.span, format!("unknown condition verb `{other}`")),
-  };
-  let (expected_reason, args) = match args.split_first() {
-    Some((first, rest)) if matches!(&first.kind, Sx::Str(_)) => {
-      let Sx::Str(reason) = &first.kind else {
-        unreachable!("matched a string");
-      };
-      (Some(reason.as_str()), rest)
-    }
-    _ => (None, args),
-  };
+/// The world a condition or rule check runs in: the binding set, the
+/// cwd, and the facts, all from keywords and none from the disk.
+struct Setup {
+  bindings: Bindings,
+  cwd: String,
+  facts: Facts,
+}
 
+/// An optional `"text"` right after the verb, and the arguments after it.
+fn leading_string(args: &[Node]) -> (Option<&str>, &[Node]) {
+  match args.split_first() {
+    Some((first, rest)) => match &first.kind {
+      Sx::Str(text) => (Some(text.as_str()), rest),
+      _ => (None, args),
+    },
+    None => (None, args),
+  }
+}
+
+/// Read `:with`, `:cwd`, `:ancestors`, and `:facts`. `:with` is refused
+/// when `with_allowed` is false, since a rule check binds from its own
+/// pattern.
+fn setup(
+  args: &[Node],
+  with_allowed: bool,
+) -> Result<Setup, TypeError> {
+  let expected_keywords = if with_allowed {
+    ":with, :cwd, :ancestors, or :facts"
+  } else {
+    ":cwd, :ancestors, or :facts"
+  };
   let mut bindings = Bindings::new();
-  let mut cwd = PathBuf::from("/spec");
+  let mut cwd = String::from("/spec");
   let mut facts = Facts::builtin();
   facts.declare(
     "ancestor-has?",
@@ -571,24 +590,30 @@ fn check_cond(
     let Sx::Keyword(name) = &key.kind else {
       return err(
         key.span,
-        format!("unexpected `{key}`; expected :with, :cwd, :ancestors, or :facts"),
+        format!("unexpected `{key}`; expected {expected_keywords}"),
       );
     };
     let Some(value) = args.get(i + 1) else {
       return err(key.span, format!("`:{name}` needs a value"));
     };
     match name.as_str() {
-      "with" => {
+      "with" if with_allowed => {
         let Sx::List(items) = &value.kind else {
           return err(value.span, "`:with` takes a list of (?name \"word\") pairs");
         };
         bindings = pairs(items)?;
       }
+      "with" => {
+        return err(
+          key.span,
+          "`:with` is for condition checks; a rule check binds from its own pattern",
+        );
+      }
       "cwd" => {
         let Sx::Str(path) = &value.kind else {
           return err(value.span, "`:cwd` takes a string");
         };
-        cwd = PathBuf::from(path);
+        cwd = path.clone();
       }
       "ancestors" => {
         let ancestors = match &value.kind {
@@ -630,10 +655,38 @@ fn check_cond(
     }
     i += 2;
   }
+  Ok(Setup {
+    bindings,
+    cwd,
+    facts,
+  })
+}
+
+fn check_cond(
+  form: &Node,
+  subject: &Node,
+  verb: &Node,
+  verb_name: &str,
+  args: &[Node],
+) -> Result<(), TypeError> {
+  let expected = match verb_name {
+    "holds" => Truth::True,
+    "fails" => Truth::False,
+    "unknown" => Truth::Unknown,
+    other => return err(verb.span, format!("unknown condition verb `{other}`")),
+  };
+  let (expected_reason, args) = leading_string(args);
+  let Setup {
+    bindings,
+    cwd,
+    facts,
+  } = setup(args, true)?;
 
   let scope = Scope::Row(bindings.keys().cloned().collect());
   let condition: Cond = cond::parse(subject, &scope, &facts)?;
-  let call = Call { cwd: &cwd };
+  let call = Call {
+    cwd: Path::new(&cwd),
+  };
   let got = condition.eval(&facts, &call, &bindings);
   if got.truth != expected {
     return err(
@@ -649,6 +702,90 @@ fn check_cond(
       match got.reason {
         Some(reason) => format!("expected reason {wanted:?}, got {reason:?}"),
         None => format!("expected reason {wanted:?}, got none"),
+      },
+    );
+  }
+  Ok(())
+}
+
+// --- rule checks ---
+
+/// `(check (rule ...) denies|asks|warns|passes "command" ["text"] ...)`:
+/// one rule run by the engine against one Bash command, with the facts
+/// stood in. The optional text must equal what the model or the user
+/// would see.
+fn check_rule(
+  form: &Node,
+  subject: &Node,
+  verb: &Node,
+  verb_name: &str,
+  args: &[Node],
+) -> Result<(), TypeError> {
+  let expected = match verb_name {
+    "denies" => Some(Kind::Deny),
+    "asks" => Some(Kind::Ask),
+    "warns" => Some(Kind::Warn),
+    "passes" => None,
+    other => return err(verb.span, format!("unknown rule verb `{other}`")),
+  };
+  let Some((command_node, args)) = args.split_first() else {
+    return err(form.span, format!("`{verb_name}` needs a command string"));
+  };
+  let Sx::Str(command) = &command_node.kind else {
+    return err(command_node.span, "expected a command string");
+  };
+  let (expected_text, args) = leading_string(args);
+  let Setup { cwd, facts, .. } = setup(args, false)?;
+
+  let file =
+    syntax::parse(std::slice::from_ref(subject), &facts).map_err(|mut errors| errors.remove(0))?;
+  let declarations = Declarations::new();
+  let ctx = Context::new(
+    HookInput {
+      session_id: "spec".into(),
+      cwd: PathBuf::from(cwd).into(),
+      tool_use_id: "spec".into(),
+      agent_id: None,
+      tool: Tool::Bash {
+        command: command.clone(),
+      },
+    },
+    &declarations,
+  );
+  let rules = Ruleset::assemble(Source::Builtin, declarations, facts, file.rules);
+  let verdict = rules.evaluate(&ctx);
+
+  let (got, text) = match &verdict {
+    None => (None, None),
+    Some(verdict) => match &verdict.decision {
+      Decision::Deny { reason } => (Some(Kind::Deny), Some(reason)),
+      Decision::Ask { reason } => (Some(Kind::Ask), Some(reason)),
+      Decision::Warn { context } => (Some(Kind::Warn), Some(context)),
+    },
+  };
+  let name = |kind: Option<Kind>| match kind {
+    None => "pass",
+    Some(Kind::Deny) => "deny",
+    Some(Kind::Ask) => "ask",
+    Some(Kind::Warn) => "warn",
+  };
+  if got != expected {
+    return err(
+      form.span,
+      match text {
+        Some(text) => format!("expected {}, got {}: {text}", name(expected), name(got)),
+        None => format!("expected {}, got {}", name(expected), name(got)),
+      },
+    );
+  }
+  if let Some(wanted) = expected_text
+    && text.map(String::as_str) != Some(wanted)
+  {
+    return err(
+      form.span,
+      match text {
+        Some(text) => format!("expected text {wanted:?}, got {text:?}"),
+        None => format!("expected text {wanted:?}, got a pass"),
       },
     );
   }
@@ -748,6 +885,55 @@ mod tests {
   }
 
   #[test]
+  fn a_false_rule_claim_says_what_the_engine_decided() {
+    const RULE: &str = "(rule r (deny [git stash] :reason \"no.\" :instead \"jj new.\"))";
+    passes(&format!("(check {RULE} denies \"git stash\")"));
+    passes(&format!(
+      "(check {RULE} denies \"git stash\" \"claude-guard denied `git stash`: no. Instead: jj new.\")"
+    ));
+    assert_eq!(
+      failures(&format!("(check {RULE} passes \"git stash\")")),
+      ["t.scm:1:1: expected pass, got deny: claude-guard denied `git stash`: no. Instead: jj new."]
+    );
+    assert_eq!(
+      failures(&format!("(check {RULE} denies \"git log\")")),
+      ["t.scm:1:1: expected deny, got pass"]
+    );
+    assert_eq!(
+      failures(&format!("(check {RULE} denies \"git stash\" \"other\")")),
+      [
+        "t.scm:1:1: expected text \"other\", got \"claude-guard denied `git stash`: no. Instead: jj new.\""
+      ]
+    );
+    assert_eq!(
+      failures(&format!("(check {RULE} passes \"git log\" \"text\")")),
+      ["t.scm:1:1: expected text \"text\", got a pass"]
+    );
+    assert_eq!(
+      failures(&format!("(check {RULE} eats \"git log\")")),
+      ["t.scm:1:69: unknown rule verb `eats`"]
+    );
+    assert_eq!(
+      failures(&format!("(check {RULE} denies)")),
+      ["t.scm:1:1: `denies` needs a command string"]
+    );
+    assert_eq!(
+      failures(&format!("(check {RULE} denies \"git stash\" :with ())")),
+      ["t.scm:1:88: `:with` is for condition checks; a rule check binds from its own pattern"]
+    );
+    // The rule itself is type-checked, with the stubs in scope.
+    assert_eq!(
+      failures(
+        "(check (rule r (deny [x] :when (nope?) :reason \"r.\" :instead \"i.\")) passes \"x\")"
+      ),
+      ["t.scm:1:33: unknown fact `nope?`"]
+    );
+    passes(
+      "(check (rule r (deny [x] :when (nope?) :reason \"r.\" :instead \"i.\")) denies \"x\" :facts ((nope? holds)))",
+    );
+  }
+
+  #[test]
   fn a_condition_check_defaults_to_no_bindings_an_empty_fs_and_a_cwd() {
     passes("(check (ancestor-has? \".jj\") fails)");
     passes("(check (under? \"x\" \"/spec\") holds)");
@@ -757,14 +943,16 @@ mod tests {
   fn facts_are_stubbed_by_name_with_an_answer_and_a_reason() {
     passes("(check (in-git? \"x\") holds :facts ((in-git? holds)))");
     passes("(check (slow?) unknown :facts ((slow? unknown \"timed out\")))");
-    passes("(check (slow?) unknown \"timed out\" :facts ((slow? unknown \"timed out\")))");
     passes(
-      "(check (and (ancestor-has? \"t\") (slow?)) unknown \"timed out\" :ancestors (\"t\") :facts ((slow? unknown \"timed out\")))",
+      "(check (slow?) unknown \"slow? is unknown: timed out\" :facts ((slow? unknown \"timed out\")))",
+    );
+    passes(
+      "(check (and (ancestor-has? \"t\") (slow?)) unknown \"slow? is unknown: timed out\" :ancestors (\"t\") :facts ((slow? unknown \"timed out\")))",
     );
     passes("(check (a?) holds \"a held\" :facts ((a? holds \"a held\")))");
     assert_eq!(
       failures("(check (slow?) unknown \"timed out\" :facts ((slow? unknown \"crashed\")))"),
-      ["t.scm:1:1: expected reason \"timed out\", got \"crashed\""]
+      ["t.scm:1:1: expected reason \"timed out\", got \"slow? is unknown: crashed\""]
     );
     assert_eq!(
       failures("(check (a?) holds \"a held\" :facts ((a? holds)))"),
@@ -814,7 +1002,7 @@ mod tests {
     );
     assert_eq!(
       failures("(check 5 matches \"a\")"),
-      ["t.scm:1:8: expected a [pattern], a (condition), or a \"command\""]
+      ["t.scm:1:8: expected a [pattern], a (condition), a (rule ...), or a \"command\""]
     );
     assert_eq!(
       failures(r#"(check "git -C ." elaborates (git))"#),

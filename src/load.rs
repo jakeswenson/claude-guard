@@ -299,13 +299,22 @@ fn read(source: Source) -> Result<(Source, File), LoadError> {
   }
 }
 
-/// Parse and type-check `text` as a file from `source`.
+/// Parse and type-check `text` as a file from `source`, naming the
+/// built-in facts.
 fn parse_text(
   source: Source,
   text: &str,
 ) -> Result<File, LoadError> {
+  parse_text_with(source, text, &crate::facts::Facts::builtin())
+}
+
+fn parse_text_with(
+  source: Source,
+  text: &str,
+  facts: &crate::facts::Facts,
+) -> Result<File, LoadError> {
   let forms = sexp::read_all(text).map_err(|e| LoadError::one(source.clone(), Problem::Read(e)))?;
-  syntax::parse(&forms, &crate::facts::Facts::builtin()).map_err(|errors| LoadError {
+  syntax::parse(&forms, facts).map_err(|errors| LoadError {
     problems: errors
       .into_iter()
       .map(|e| Located {
@@ -323,10 +332,21 @@ pub fn load_text(
   source: Source,
   text: &str,
 ) -> Result<Loaded, LoadError> {
+  load_text_with(source, text, &crate::facts::Facts::builtin())
+}
+
+/// [`load_text`] with the facts a condition may name given, so a test can
+/// stand in a fact the binary does not ship.
+#[cfg(test)]
+pub fn load_text_with(
+  source: Source,
+  text: &str,
+  facts: &crate::facts::Facts,
+) -> Result<Loaded, LoadError> {
   let mut declarations = Declarations::new();
-  let builtin = parse_text(Source::BuiltinCommands, BUILTIN_COMMANDS)?;
+  let builtin = parse_text_with(Source::BuiltinCommands, BUILTIN_COMMANDS, facts)?;
   declare_all(&mut declarations, &builtin);
-  let file = parse_text(source.clone(), text)?;
+  let file = parse_text_with(source.clone(), text, facts)?;
   declare_all(&mut declarations, &file);
   Ok(Loaded {
     source,

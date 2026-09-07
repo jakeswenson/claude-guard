@@ -8,12 +8,14 @@
 //!
 //! A row fires when its subject matches and its condition holds under
 //! some binding set the match produced. A rule's own `:when` is checked
-//! once, before its rows. An unknown condition does not fire a row in
-//! this version.
+//! once, before its rows: false skips the rule, unknown lets its rows be
+//! tried. A matched deny or ask row whose condition, or whose rule's
+//! `:when`, is unknown asks, with the reason in parentheses as evidence
+//! (D14, ADR 0001). A warn row in that position skips.
 
 use std::path::{Path, PathBuf};
 
-use crate::cond;
+use crate::cond::{self, Choice};
 use crate::elaborate::{Declarations, Elaborated, Inner};
 use crate::facts::{Call, Facts, Truth};
 use crate::input::{HookInput, Tool, string_id};
@@ -117,6 +119,9 @@ pub struct Verdict {
   /// What the row's binders captured. Empty when the row has none.
   pub bindings: Bindings,
   pub decision: Decision,
+  /// Why the row's condition, or its rule's `:when`, could not be
+  /// settled, when the decision is an ask for that reason (D14).
+  pub unknown: Option<String>,
 }
 
 /// A loaded rule table, ready to evaluate.
@@ -151,8 +156,39 @@ impl Ruleset {
     load::load_text(Source::Builtin, text).map(Ruleset::from)
   }
 
+  /// A table from text whose conditions may name the given facts, which
+  /// the table then evaluates with. For tests.
+  #[cfg(test)]
+  pub fn from_text_with(
+    text: &str,
+    facts: Facts,
+  ) -> Result<Ruleset, LoadError> {
+    let loaded = load::load_text_with(Source::Builtin, text, &facts)?;
+    Ok(Ruleset::assemble(
+      loaded.source,
+      loaded.declarations,
+      facts,
+      loaded.file.rules,
+    ))
+  }
+
   pub fn rules(&self) -> &[Rule] {
     &self.rules
+  }
+
+  /// A table from its parts, for the spec runner.
+  pub fn assemble(
+    source: Source,
+    declarations: Declarations,
+    facts: Facts,
+    rules: Vec<Rule>,
+  ) -> Ruleset {
+    Ruleset {
+      source,
+      declarations,
+      facts,
+      rules,
+    }
   }
 
   /// First opinion wins. `None` means the call proceeds untouched.
@@ -168,6 +204,7 @@ impl Ruleset {
         decision: Decision::Ask {
           reason: format!("claude-guard could not parse this command: {e}"),
         },
+        unknown: None,
       });
     }
 
@@ -175,20 +212,33 @@ impl Ruleset {
       cwd: ctx.input.cwd.as_ref(),
     };
     for rule in &self.rules {
-      if let Some(when) = &rule.when
-        && when.eval(&self.facts, &call, &Bindings::new()).truth != Truth::True
-      {
-        continue;
-      }
-      for row in &rule.rows {
-        if let Some((what, bindings)) = find(row, ctx, &self.declarations, &self.facts, &call) {
-          return Some(Verdict {
-            rule: rule.name.clone(),
-            pattern: Some(PatternText::from(row.subject.to_string())),
-            decision: render(row, &what),
-            bindings,
-          });
+      let rule_unknown = match &rule.when {
+        None => None,
+        Some(when) => {
+          let answer = when.eval(&self.facts, &call, &Bindings::new());
+          match answer.truth {
+            Truth::True => None,
+            Truth::False => continue,
+            Truth::Unknown => Some(answer.reason.unwrap_or_else(|| "unknown".into())),
+          }
         }
+      };
+      for row in &rule.rows {
+        let Some(found) = find(row, ctx, &self.declarations, &self.facts, &call) else {
+          continue;
+        };
+        // The rule's `:when` ran first, so its unknown is the evidence.
+        let unknown = rule_unknown.clone().or(found.unknown);
+        if unknown.is_some() && row.decision == Kind::Warn {
+          continue;
+        }
+        return Some(Verdict {
+          rule: rule.name.clone(),
+          pattern: Some(PatternText::from(row.subject.to_string())),
+          decision: render(row, &found.what, unknown.as_deref()),
+          bindings: found.bindings,
+          unknown,
+        });
       }
     }
 
@@ -208,6 +258,7 @@ impl Ruleset {
         decision: Decision::Warn {
           context: format!("claude-guard did not inspect: {list}"),
         },
+        unknown: None,
       });
     }
 
@@ -230,15 +281,45 @@ impl From<Loaded> for Ruleset {
 /// `bash -c` carrying `sudo` is three.
 const INNER_DEPTH: usize = 8;
 
-/// The text of what matched and the bindings that satisfied the row's
-/// condition, or `None`.
+/// A row whose subject matched: the text of what matched, the bindings
+/// the condition was judged under, and the reason the condition came
+/// back unknown, when it did.
+struct Found {
+  what: String,
+  bindings: Bindings,
+  unknown: Option<String>,
+}
+
+impl Found {
+  fn from_choice(
+    what: impl FnOnce() -> String,
+    choice: Choice,
+  ) -> Option<Found> {
+    match choice {
+      Choice::Holds(bindings) => Some(Found {
+        what: what(),
+        bindings,
+        unknown: None,
+      }),
+      Choice::Unknown { bindings, reason } => Some(Found {
+        what: what(),
+        bindings,
+        unknown: Some(reason),
+      }),
+      Choice::NoMatch => None,
+    }
+  }
+}
+
+/// The first place the row's subject matches, outermost first, whether
+/// its condition held or was unknown there.
 fn find(
   row: &Row,
   ctx: &Context,
   declarations: &Declarations,
   facts: &Facts,
   call: &Call<'_>,
-) -> Option<(String, Bindings)> {
+) -> Option<Found> {
   match (&row.subject, &ctx.seen) {
     (Subject::Command(pattern), Seen::Bash(Ok(_))) => ctx
       .elaborated
@@ -255,8 +336,8 @@ fn find(
         }
         PathArg::Var(var) => Bindings::from([(var.clone(), text.clone())]),
       };
-      let chosen = cond::choose(row.when.as_ref(), vec![candidate], facts, call)?;
-      Some((text, chosen))
+      let choice = cond::choose(row.when.as_ref(), vec![candidate], facts, call);
+      Found::from_choice(|| text, choice)
     }
     _ => None,
   }
@@ -264,7 +345,8 @@ fn find(
 
 /// Match `pattern` against one elaborated command, then against whatever
 /// it carries: an inner command as is, an inner script segmented and
-/// elaborated first. The first hit wins, outermost first.
+/// elaborated first. The first hit wins, outermost first; a hit is a
+/// match whose condition held or was unknown.
 fn find_in(
   row: &Row,
   pattern: &Pattern,
@@ -273,10 +355,11 @@ fn find_in(
   facts: &Facts,
   call: &Call<'_>,
   depth: usize,
-) -> Option<(String, Bindings)> {
+) -> Option<Found> {
   let candidates = pattern.bindings_in(&command.units(), &command.redirects);
-  if let Some(chosen) = cond::choose(row.when.as_ref(), candidates, facts, call) {
-    return Some((describe(command), chosen));
+  let choice = cond::choose(row.when.as_ref(), candidates, facts, call);
+  if let Some(found) = Found::from_choice(|| describe(command), choice) {
+    return Some(found);
   }
   if depth >= INNER_DEPTH {
     return None;
@@ -296,15 +379,24 @@ fn find_in(
   }
 }
 
+/// The row's decision as text. With `unknown`, a deny or ask row renders
+/// as an ask and the evidence goes last in parentheses; the caller never
+/// passes `unknown` for a warn row.
 fn render(
   row: &Row,
   what: &str,
+  unknown: Option<&str>,
 ) -> Decision {
   let reason = &row.reason;
   let instead = match &row.instead {
     Some(instead) => format!(" Instead: {instead}"),
     None => String::new(),
   };
+  if let Some(evidence) = unknown {
+    return Decision::Ask {
+      reason: format!("claude-guard asks about `{what}`: {reason}{instead} ({evidence})"),
+    };
+  }
   match row.decision {
     Kind::Deny => Decision::Deny {
       reason: format!("claude-guard denied `{what}`: {reason}{instead}"),
@@ -372,6 +464,7 @@ pub mod testing {
 mod tests {
   use super::testing::{builtin_in_repo, in_repo};
   use super::*;
+  use crate::facts::{Ancestors, Answer, Stub};
   use crate::pattern::Var;
 
   fn input(tool: Tool) -> HookInput {
@@ -947,6 +1040,117 @@ mod tests {
         }
       )
       .is_none()
+    );
+  }
+
+  // --- unknown asks (D14, ADR 0001) ---
+
+  fn run_with_facts(
+    text: &str,
+    tool: Tool,
+    stubs: &[(&str, Answer)],
+  ) -> Option<Verdict> {
+    let mut facts = Facts::builtin();
+    facts.declare(
+      "ancestor-has?",
+      Ancestors {
+        present: vec![],
+        unknown: false,
+      },
+    );
+    for (name, answer) in stubs {
+      facts.declare(*name, Stub(answer.clone()));
+    }
+    let rules = Ruleset::from_text_with(text, facts).unwrap_or_else(|e| panic!("{e}"));
+    rules.evaluate(&Context::new(input(tool), &rules.declarations))
+  }
+
+  #[test]
+  fn a_matched_row_with_an_unknown_condition_asks_with_the_evidence() {
+    let stubs = [("in-jj-repo?", Answer::unknown("timed out after 1s"))];
+    let text = "(rule r (deny [git -... stash ...] :when (in-jj-repo?) :reason \"no stash.\" :instead \"jj new.\"))";
+    let verdict = run_with_facts(text, bash("git stash"), &stubs).unwrap();
+    assert_eq!(
+      verdict.decision,
+      Decision::Ask {
+        reason: "claude-guard asks about `git stash`: no stash. Instead: jj new. \
+                 (in-jj-repo? is unknown: timed out after 1s)"
+          .into()
+      }
+    );
+    assert_eq!(
+      verdict.unknown.as_deref(),
+      Some("in-jj-repo? is unknown: timed out after 1s")
+    );
+    assert_eq!(verdict.rule, RuleName::from("r"));
+    assert_eq!(
+      verdict.pattern,
+      Some(PatternText::from("[git -... stash ...]"))
+    );
+    // A pattern that did not match is not an ask.
+    assert_eq!(run_with_facts(text, bash("git log"), &stubs), None);
+    // A warn row skips, and a later row still decides.
+    let warn = "(rule r (warn [git -... stash ...] :when (in-jj-repo?) :reason \"hm.\"))";
+    assert_eq!(run_with_facts(warn, bash("git stash"), &stubs), None);
+    let then_deny = "(rule r (warn [git ...] :when (in-jj-repo?) :reason \"hm.\") (deny [git ...] :reason \"no.\" :instead \"i.\"))";
+    let verdict = run_with_facts(then_deny, bash("git stash"), &stubs).unwrap();
+    assert!(matches!(verdict.decision, Decision::Deny { .. }));
+    assert_eq!(verdict.unknown, None);
+  }
+
+  #[test]
+  fn an_unknown_rule_when_asks_on_a_matching_row() {
+    let stubs = [("in-jj-repo?", Answer::unknown("timed out"))];
+    let text = "(rule r :when (in-jj-repo?) (deny [git ...] :reason \"jj.\" :instead \"use jj.\") (warn [cargo ...] :reason \"slow.\"))";
+    let verdict = run_with_facts(text, bash("git log"), &stubs).unwrap();
+    assert_eq!(
+      verdict.decision,
+      Decision::Ask {
+        reason: "claude-guard asks about `git log`: jj. Instead: use jj. (in-jj-repo? is unknown: timed out)".into()
+      }
+    );
+    assert_eq!(run_with_facts(text, bash("cargo build"), &stubs), None);
+    assert_eq!(run_with_facts(text, bash("ls"), &stubs), None);
+    // The rule's `:when` ran first, so its reason is the evidence even
+    // when the row's condition is unknown too.
+    let both = [
+      ("a?", Answer::unknown("a out")),
+      ("b?", Answer::unknown("b out")),
+    ];
+    let text = "(rule r :when (a?) (deny [x] :when (b?) :reason \"r.\" :instead \"i.\"))";
+    assert_eq!(
+      run_with_facts(text, bash("x"), &both)
+        .unwrap()
+        .unknown
+        .as_deref(),
+      Some("a? is unknown: a out")
+    );
+    // A false rule `:when` still skips the rule whole.
+    let off = [("a?", Answer::fails()), ("b?", Answer::unknown("b out"))];
+    assert_eq!(run_with_facts(text, bash("x"), &off), None);
+  }
+
+  #[test]
+  fn a_file_tool_row_with_an_unknown_condition_asks() {
+    let stubs = [("fresh?", Answer::unknown("no read recorded"))];
+    let text = "(rule r (deny (write ?p) :when (fresh?) :reason \"stale.\" :instead \"read it.\"))";
+    let verdict = run_with_facts(
+      text,
+      Tool::Write {
+        path: "/x/a.rs".into(),
+      },
+      &stubs,
+    )
+    .unwrap();
+    assert_eq!(
+      verdict.decision,
+      Decision::Ask {
+        reason: "claude-guard asks about `/x/a.rs`: stale. Instead: read it. (fresh? is unknown: no read recorded)".into()
+      }
+    );
+    assert_eq!(
+      verdict.bindings,
+      Bindings::from([(Var::from("p"), "/x/a.rs".to_string())])
     );
   }
 
