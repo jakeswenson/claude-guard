@@ -341,6 +341,131 @@ fn extern_asks_one_fact_by_hand_and_exits_with_its_answer() {
     .stderr(predicate::str::contains("needs a fact name"));
 }
 
+/// The example facts under `examples/facts/`, as the tutorial and the
+/// how-to show them, run through the binary. What the docs say is what
+/// the binary does.
+#[test]
+fn the_documented_example_facts_run_as_written() {
+  let examples = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/facts");
+  let state = state_dir();
+  let rules = state.path().join("rules.scm");
+  let text = fs::read_to_string(examples.join("rules.scm"))
+    .unwrap()
+    .replace(
+      "/Users/you/.config/claude-guard/facts",
+      &examples.display().to_string(),
+    );
+  fs::write(&rules, text).unwrap();
+
+  // A repository on `main` with one commit, so HEAD names a branch.
+  let repo = state.path().join("repo");
+  fs::create_dir_all(&repo).unwrap();
+  let git = |args: &[&str]| {
+    let status = std::process::Command::new("git")
+      .args([
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "-c",
+        "commit.gpgsign=false",
+      ])
+      .args(args)
+      .current_dir(&repo)
+      .stdout(std::process::Stdio::null())
+      .stderr(std::process::Stdio::null())
+      .status()
+      .expect("git runs");
+    assert!(status.success(), "git {args:?}");
+  };
+  git(&["init", "-q", "-b", "main", "."]);
+  fs::write(repo.join("tracked.txt"), "x\n").unwrap();
+  git(&["add", "tracked.txt"]);
+  git(&["commit", "-q", "-m", "one"]);
+
+  let extern_in = |dir: &Path, args: &[&str]| {
+    let mut command = guard_logging_to(state.path());
+    command.env("CLAUDE_GUARD_RULES", &rules).current_dir(dir);
+    command.arg("extern").args(args).write_stdin("").assert()
+  };
+  let hook_in = |dir: &Path, command_text: &str| {
+    let mut command = guard_logging_to(state.path());
+    command.env("CLAUDE_GUARD_RULES", &rules);
+    command
+      .arg("hook")
+      .write_stdin(bash_call_in(dir, command_text))
+      .assert()
+      .code(0)
+  };
+
+  // Tutorial step 4: by hand, in and out of a repository.
+  extern_in(&repo, &["on-main?"])
+    .code(0)
+    .stdout(predicate::str::starts_with("on-main? holds: on main ("));
+  extern_in(state.path(), &["on-main?"])
+    .code(2)
+    .stdout(predicate::str::starts_with(
+      "on-main? is unknown: exited with status 3 (",
+    ));
+
+  // Tutorial step 6: the rule asks on main, passes elsewhere, asks when
+  // the fact cannot answer.
+  hook_in(&repo, "git push origin main").stdout(predicate::str::contains(
+    "claude-guard asks about `git push origin main`: this pushes the main branch. \
+     Instead: push a feature branch and open a pull request. (on main)",
+  ));
+  git(&["switch", "-q", "-c", "feature"]);
+  hook_in(&repo, "git push origin main").stdout("");
+  git(&["switch", "-q", "main"]);
+  hook_in(state.path(), "git push origin main").stdout(predicate::str::contains(
+    "(on-main? is unknown: exited with status 3)",
+  ));
+
+  // Tutorial step 7: the log names the fact.
+  let log = fs::read_to_string(state.path().join("sessions").join("abc123.jsonl")).unwrap();
+  let first: serde_json::Value = serde_json::from_str(log.lines().next().unwrap()).unwrap();
+  assert_eq!(first["facts"][0]["name"], "on-main?");
+  assert_eq!(first["facts"][0]["truth"], "true");
+  assert_eq!(first["facts"][0]["reason"], "on main");
+
+  // How-to: arguments from the rule reach the shell script.
+  if cfg!(target_os = "macos") {
+    extern_in(&repo, &["owned-by?", "root", "/etc/hosts"])
+      .code(0)
+      .stdout(predicate::str::starts_with(
+        "owned-by? holds: root owns /etc/hosts (",
+      ));
+    hook_in(&repo, "cp a /etc/hosts").stdout(predicate::str::contains(
+      "claude-guard denied `cp a /etc/hosts`: the target belongs to root. \
+       Instead: copy somewhere you own, or ask. (root owns /etc/hosts)",
+    ));
+    hook_in(&repo, "cp a tracked.txt").stdout("");
+  }
+
+  // How-to: the Python fact reads the subject from stdin.
+  let python = std::process::Command::new("python3")
+    .arg("--version")
+    .output()
+    .is_ok_and(|o| o.status.success());
+  if python {
+    let mut command = guard_logging_to(state.path());
+    command.env("CLAUDE_GUARD_RULES", &rules);
+    command
+      .arg("extern")
+      .arg("touches-tracked?")
+      .write_stdin(bash_call_in(&repo, "cargo build > out.txt"))
+      .assert()
+      .code(1)
+      .stdout(predicate::str::starts_with(
+        "touches-tracked? fails: untracked: out.txt (",
+      ));
+    hook_in(&repo, "cargo build > out.txt").stdout(predicate::str::contains(
+      "claude-guard noted `cargo build > out.txt`: this writes a file git does not track. (untracked: out.txt)",
+    ));
+    hook_in(&repo, "cargo build > tracked.txt").stdout("");
+  }
+}
+
 #[test]
 fn a_fact_declaration_that_does_not_load_fails_open_with_its_position() {
   let state = state_dir();

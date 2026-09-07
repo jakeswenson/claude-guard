@@ -50,10 +50,10 @@ prints the rules in force. The guard exits 0 whatever happens, so a bug in it ne
 
 ## Documentation
 
-- [Getting started](docs/tutorials/getting-started.md): install, wire the hooks, watch a deny, write a rule, declare a command. One sitting.
-- How-to guides: [write a rule](docs/how-to/write-a-rule.md), [declare a command](docs/how-to/declare-a-command.md), [replace the built-in rules](docs/how-to/replace-the-builtin-rules.md), [review what the guard is doing](docs/how-to/review-the-guard.md).
+- Tutorials: [getting started](docs/tutorials/getting-started.md) installs the guard, wires the hooks, and writes a first rule in one sitting; [a first external fact](docs/tutorials/a-first-external-fact.md) has a script of yours decide a rule.
+- How-to guides: [write a rule](docs/how-to/write-a-rule.md), [write an external fact](docs/how-to/write-an-external-fact.md), [declare a command](docs/how-to/declare-a-command.md), [replace the built-in rules](docs/how-to/replace-the-builtin-rules.md), [review what the guard is doing](docs/how-to/review-the-guard.md).
 - Reference: [the rule language](docs/reference/rule-language.md), [the command line](docs/reference/command-line.md), [hooks](docs/reference/hooks.md), [the log format](docs/reference/log-format.md).
-- Explanation: [why a policy language](docs/explanation/why-a-policy-language.md), [elaboration](docs/explanation/elaboration.md), the [design decision logs](docs/design/) that record how the design was reached, and the [architecture decision records](docs/adrs/) for choices made while building.
+- Explanation: [why a policy language](docs/explanation/why-a-policy-language.md), [external facts](docs/explanation/external-facts.md), [elaboration](docs/explanation/elaboration.md), the [design decision logs](docs/design/) that record how the design was reached, and the [architecture decision records](docs/adrs/) for choices made while building.
 
 ## What it does today
 

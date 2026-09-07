@@ -68,7 +68,7 @@ cargo fmt                      # rustfmt config: 2 spaces, vertical fn params
 cargo install --path .         # a dev build into ~/.cargo/bin; users get `cargo install claude-guard`
 ```
 
-Tests never touch the real state or config directories: set `CLAUDE_GUARD_STATE_DIR`, `CLAUDE_GUARD_RULES`, and `CLAUDE_GUARD_COMMANDS_DIR` to temp dirs, as `tests/cli.rs` does. `spec/*.scm` holds `check` forms run by `spec::tests::the_spec_passes`; every matcher, condition, elaborator, engine, and fact behavior has a line there, and no check touches the disk or starts a process (`:ancestors`, `:facts`, and `:asked` stand in). The stdio protocol of a declared fact is tested in Rust with `sh -c` scripts. `tests/fixtures/commands.jsonl` is a corpus of real logged commands for the elaborator's round-trip test.
+Tests never touch the real state or config directories: set `CLAUDE_GUARD_STATE_DIR`, `CLAUDE_GUARD_RULES`, and `CLAUDE_GUARD_COMMANDS_DIR` to temp dirs, as `tests/cli.rs` does. `spec/*.scm` holds `check` forms run by `spec::tests::the_spec_passes`; every matcher, condition, elaborator, engine, and fact behavior has a line there, and no check touches the disk or starts a process (`:ancestors`, `:facts`, and `:asked` stand in). The stdio protocol of a declared fact is tested in Rust with `sh -c` scripts. `examples/facts/` holds the scripts and rules the tutorial and how-to show, and a CLI test runs them through the binary so the docs cannot drift. `tests/fixtures/commands.jsonl` is a corpus of real logged commands for the elaborator's round-trip test.
 
 ## Architecture Overview
 

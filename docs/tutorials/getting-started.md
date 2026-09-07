@@ -122,6 +122,7 @@ The last line says how many commands were checked and that zero failed to round-
 
 ## Where to go next
 
+- [A first external fact](a-first-external-fact.md) has a script of yours answer a question a rule needs, in fifteen minutes.
 - [Write a rule](../how-to/write-a-rule.md) covers patterns, binders, and conditions.
 - [Declare a command](../how-to/declare-a-command.md) covers writing declarations by hand, including programs that wrap other commands.
 - [The rule language](../reference/rule-language.md) is the complete grammar and its meaning on one page.

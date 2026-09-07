@@ -62,7 +62,9 @@ A condition guards a row with `:when`, or a whole rule when placed after its nam
 (deny [cp ?src ?dst] :when (and (under? ?src "/etc") (not (under? ?dst "/etc"))) ...)
 ```
 
-Two facts exist today: `(ancestor-has? "name")`, true when the working directory or any directory above it contains `name`, and `(under? path "prefix")`, true when the path is the prefix or below it. A relative path resolves against the call's working directory, and `/private/tmp` counts as `/tmp`. `and`, `or`, and `not` combine them. Naming a fact the guard does not know is a load error.
+Two facts are built in: `(ancestor-has? "name")`, true when the working directory or any directory above it contains `name`, and `(under? path "prefix")`, true when the path is the prefix or below it. A relative path resolves against the call's working directory, and `/private/tmp` counts as `/tmp`. `and`, `or`, and `not` combine them. Naming a fact the guard does not know is a load error.
+
+Any other question is a fact you declare, answered by a program of yours: `(fact on-main? (exec "/path/to/on-main.sh") :lifetime fresh :timeout "1s")`, then `(on-main?)` in a condition. [Write an external fact](write-an-external-fact.md) has the contract. When such a fact cannot answer, a matched deny or ask row asks instead of deciding, with the fact named in parentheses, and a warn row says nothing.
 
 A binder used in a condition must appear in the row's pattern. A rule-level `:when` runs before any pattern matches, so it cannot use binders. Both are load-time errors with a position.
 
